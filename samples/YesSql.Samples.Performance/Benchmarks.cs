@@ -1,18 +1,21 @@
 using BenchmarkDotNet.Attributes;
+using BenchmarkDotNet.Engines;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Threading.Tasks;
-using YesSql.Provider.SqlServer;
+using YesSql.Provider.PostgreSql;
 using YesSql.Services;
 using YesSql.Sql;
 
 namespace YesSql.Samples.Performance
 {
-    [ClrJob, CoreJob]
+    [MemoryDiagnoser, ShortRunJob]
     public class Benchmarks
     {
+        private readonly Consumer _consumer = new Consumer();
+
         IStore _store;
 
         public Benchmarks()
@@ -22,34 +25,45 @@ namespace YesSql.Samples.Performance
 
         private async Task InitializeAsync()
         {
-            _store = new Store(
-                new Configuration()
-                    .UseSqlServer(@"Data Source =.; Initial Catalog = yessql; Integrated Security = True")
+            var configuration = new Configuration()
+                    .UsePostgreSql(@"Server=localhost;Port=5432;Database=yessql;User Id=root;Password=Password12!;")
                     .SetTablePrefix("Performance")
-                );
+                    ;
 
             try
             {
-                using (var session = _store.CreateSession())
-                {
-                    new SchemaBuilder(session)
-                        .DropTable("UserByName")
-                        .DropTable("Identifiers")
-                        .DropTable("Document");
-                }
+                await using var connection = configuration.ConnectionFactory.CreateConnection();
+                await connection.OpenAsync();
+
+                await using var transaction = await connection.BeginTransactionAsync();
+                var builder = new SchemaBuilder(configuration, transaction);
+
+                await builder.DropTableAsync("UserByName");
+                await builder.DropTableAsync("Identifiers");
+                await builder.DropTableAsync(configuration.TableNameConvention.GetDocumentTable(""));
+
+                await transaction.CommitAsync();
             }
             catch { }
 
-            await _store.InitializeAsync();
+            _store = await StoreFactory.CreateAndInitializeAsync(configuration);
 
-            using (var session = _store.CreateSession())
+            await using (var connection = configuration.ConnectionFactory.CreateConnection())
             {
-                new SchemaBuilder(session).CreateMapIndexTable("UserByName", table => table
-                        .Column<string>("Name")
-                    )
-                    .AlterTable("UserByName", table => table
-                        .CreateIndex("IX_Name", "Name")
-                    );
+                await connection.OpenAsync();
+
+                await using var transaction = await connection.BeginTransactionAsync();
+                var builder = new SchemaBuilder(configuration, transaction);
+
+                await builder.CreateMapIndexTableAsync<UserByName>(table => table
+                    .Column<string>("Name")
+                );
+
+                await builder.AlterTableAsync("UserByName", table => table
+                    .CreateIndex("IX_Name", "Name")
+                );
+
+                await transaction.CommitAsync();
             }
 
             _store.RegisterIndexes<UserIndexProvider>();
@@ -58,137 +72,142 @@ namespace YesSql.Samples.Performance
             await CreateUsersAsync();
 
             // pre initialize configuration
-            _store.CreateSession().Dispose();
+            await _store.CreateSession().DisposeAsync();
 
             await WriteAllWithYesSql();
         }
 
         [Benchmark]
-        public async Task<IEnumerable<UserByName>> QueryIndexByFullName1()
+        public async Task QueryIndexByFullName1()
         {
             var rnd = new Random();
             var names = Enumerable.Range(1, 1).Select(x => Names[rnd.Next(Names.Length - 1)]).ToArray();
 
-            using (var session = _store.CreateSession())
+            await using var session = _store.CreateSession();
+            foreach (var user in await session.QueryIndex<UserByName>(x => x.Name.IsIn(names)).ListAsync())
             {
-                return await session.QueryIndex<UserByName>(x => x.Name.IsIn(names)).ListAsync();
+                _consumer.Consume(user);
             }
         }
 
         [Benchmark]
-        public async Task<IEnumerable<UserByName>> QueryIndexByFullName10()
+        public async Task QueryIndexByFullName10()
         {
             var rnd = new Random();
             var names = Enumerable.Range(1, 10).Select(x => Names[rnd.Next(Names.Length - 1)]).ToArray();
 
-            using (var session = _store.CreateSession())
+            await using var session = _store.CreateSession();
+            foreach (var user in await session.QueryIndex<UserByName>(x => x.Name.IsIn(names)).ListAsync())
             {
-                return await session.QueryIndex<UserByName>(x => x.Name.IsIn(names)).ListAsync();
+                _consumer.Consume(user);
             }
         }
 
         [Benchmark]
-        public async Task<IEnumerable<UserByName>> QueryIndexByFullName100()
+        public async Task QueryIndexByFullName100()
         {
             var rnd = new Random();
             var names = Enumerable.Range(1, 100).Select(x => Names[rnd.Next(Names.Length - 1)]).ToArray();
 
-            using (var session = _store.CreateSession())
+            await using var session = _store.CreateSession();
+            foreach (var user in await session.QueryIndex<UserByName>(x => x.Name.IsIn(names)).ListAsync())
             {
-                return await session.QueryIndex<UserByName>(x => x.Name.IsIn(names)).ListAsync();
+                _consumer.Consume(user);
             }
         }
 
         [Benchmark]
-        public async Task<IEnumerable<User>> QueryByFullName1()
+        public async Task QueryByFullName1()
         {
             var rnd = new Random();
             var names = Enumerable.Range(1, 1).Select(x => Names[rnd.Next(Names.Length - 1)]).ToArray();
 
-            using (var session = _store.CreateSession())
+            await using var session = _store.CreateSession();
+            foreach (var user in await session.Query<User, UserByName>(x => x.Name.IsIn(names)).ListAsync())
             {
-                return await session.Query<User, UserByName>(x => x.Name.IsIn(names)).ListAsync();
+                _consumer.Consume(user);
             }
         }
 
         [Benchmark]
-        public async Task<IEnumerable<User>> QueryByFullName10()
+        public async Task QueryByFullName10()
         {
             var rnd = new Random();
             var names = Enumerable.Range(1, 10).Select(x => Names[rnd.Next(Names.Length - 1)]).ToArray();
 
-            using (var session = _store.CreateSession())
+            await using var session = _store.CreateSession();
+            foreach (var user in await session.Query<User, UserByName>(x => x.Name.IsIn(names)).ListAsync())
             {
-                return await session.Query<User, UserByName>(x => x.Name.IsIn(names)).ListAsync();
+                _consumer.Consume(user);
             }
         }
 
         [Benchmark]
-        public async Task<IEnumerable<User>> QueryByFullName100()
+        public async Task QueryByFullName100()
         {
             var rnd = new Random();
             var names = Enumerable.Range(1, 100).Select(x => Names[rnd.Next(Names.Length - 1)]).ToArray();
 
-            using (var session = _store.CreateSession())
+            await using var session = _store.CreateSession();
+            foreach (var user in await session.Query<User, UserByName>(x => x.Name.IsIn(names)).ListAsync())
             {
-                return await session.Query<User, UserByName>(x => x.Name.IsIn(names)).ListAsync();
+                _consumer.Consume(user);
             }
         }
 
         [Benchmark]
         public ISession CreateSession()
         {
-            using (var session = _store.CreateSession())
-            {
-                return session;
-            }
+            using var session = _store.CreateSession();
+            return session;
         }
 
         [Benchmark]
-        public async Task<IEnumerable<UserByName>> QuerySql()
+        public async Task QuerySql()
         {
             var rnd = new Random();
             var names = Enumerable.Range(1, 1).Select(x => Names[rnd.Next(Names.Length - 1)]).ToArray();
 
-            using (var session = _store.CreateSession())
+            await using var session = _store.CreateSession();
+            foreach (var user in await session.QueryIndex<UserByName>().Where("Name = '" + names[0] + "'").ListAsync())
             {
-                return await session.QueryIndex<UserByName>().Where("Name = '" + names[0] + "'").ListAsync();
+                _consumer.Consume(user);
             }
         }
 
         [Benchmark]
-        public async Task<IEnumerable<UserByName>> QueryParameterizedSql()
+        public async Task QueryParameterizedSql()
         {
             var rnd = new Random();
             var names = Enumerable.Range(1, 1).Select(x => Names[rnd.Next(Names.Length - 1)]).ToArray();
 
-            using (var session = _store.CreateSession())
+            await using var session = _store.CreateSession();
+            foreach (var user in await session.QueryIndex<UserByName>().Where("Name = @Name").WithParameter("Name", names[0]).ListAsync())
             {
-                return await session.QueryIndex<UserByName>().Where("Name = @Name").WithParameter("Name", names[0]).ListAsync();
+                _consumer.Consume(user);
             }
         }
 
         [Benchmark]
-        public async Task<IEnumerable<UserByName>> QueryLinq()
+        public async Task QueryLinq()
         {
             var rnd = new Random();
             var names = Enumerable.Range(1, 1).Select(x => Names[rnd.Next(Names.Length - 1)]).ToArray();
 
-            using (var session = _store.CreateSession())
+            await using var session = _store.CreateSession();
+            foreach (var user in await session.QueryIndex<UserByName>(x => x.Name == names[0]).ListAsync())
             {
-                return await session.QueryIndex<UserByName>(x => x.Name == names[0]).ListAsync();
+                _consumer.Consume(user);
             }
         }
-        
+
         private async Task CleanAsync()
         {
-            using (var session = _store.CreateSession())
+            await using var session = _store.CreateSession();
+            var documents = await session.Query().For<User>().ListAsync();
+            foreach (var document in documents)
             {
-                var documents = await session.Query().For<User>().ListAsync();
-                foreach (var document in documents)
-                {
-                    session.Delete(document);
-                }
+                session.Delete(document);
             }
         }
 
@@ -199,7 +218,7 @@ namespace YesSql.Samples.Performance
             foreach (var name in Names)
             {
                 batch++;
-                session.Save(new User
+                await session.SaveAsync(new User
                 {
                     Email = name + "@" + name + ".name",
                     Name = name
@@ -207,14 +226,13 @@ namespace YesSql.Samples.Performance
 
                 if (batch % batchSize == 0)
                 {
-                    session.Dispose();
+                    await session.DisposeAsync();
                     session = _store.CreateSession();
                 }
             }
 
-            await session.CommitAsync();
-
-            session.Dispose();
+            await session.SaveChangesAsync();
+            await session.DisposeAsync();
         }
 
         public async Task CreateUsersAsync()
@@ -236,17 +254,23 @@ namespace YesSql.Samples.Performance
 
                 if (batch % batchSize == 0)
                 {
-                    users.ForEach(u => session.Save(u));
-                    await session.CommitAsync();
-                    session.Dispose();
+                    foreach(var user in users)
+                    {
+                        await session.SaveAsync(user);
+                    }
+                    await session.SaveChangesAsync();
+                    await session.DisposeAsync();
                     session = _store.CreateSession();
                     users = new List<User>();
                 }
             }
 
-            users.ForEach(u => session.Save(u));
-            await session.CommitAsync();
-            session.Dispose();
+            foreach(var user in users)
+            {
+                await session.SaveAsync(user);
+            }
+            await session.SaveChangesAsync();
+            await session.DisposeAsync();
             session = _store.CreateSession();
         }
 

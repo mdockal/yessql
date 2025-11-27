@@ -6,48 +6,31 @@ namespace YesSql.Provider.Sqlite
 {
     public static class SqliteDbProviderOptionsExtensions
     {
-        public static IConfiguration RegisterSqLite(this IConfiguration configuration)
-        {
-            SqlDialectFactory.SqlDialects["sqliteconnection"] = new SqliteDialect();
-            CommandInterpreterFactory.CommandInterpreters["sqliteconnection"] = d => new SqliteCommandInterpreter(d);
-
-            return configuration;
-        }
-
-        public static IConfiguration UseInMemory(this IConfiguration configuration)
-        {
-            const string inMemoryConnectionString = "Data Source=:memory:";
-            return UseSqLite(configuration, inMemoryConnectionString, IsolationLevel.Serializable, shareConnection: true);
-        }
-
         public static IConfiguration UseSqLite(
             this IConfiguration configuration,
             string connectionString)
         {
             return UseSqLite(
-                configuration, 
-                connectionString, 
+                configuration,
+                connectionString,
                 IsolationLevel.Serializable);
         }
 
         public static IConfiguration UseSqLite(
             this IConfiguration configuration,
             string connectionString,
-            IsolationLevel isolationLevel,
-            bool shareConnection = false)
+            IsolationLevel isolationLevel)
         {
-            if (configuration == null)
-            {
-                throw new ArgumentNullException(nameof(configuration));
-            }
+            ArgumentNullException.ThrowIfNull(configuration);
 
-            if (String.IsNullOrWhiteSpace(connectionString))
+            if (string.IsNullOrWhiteSpace(connectionString))
             {
                 throw new ArgumentException(nameof(connectionString));
             }
 
-            RegisterSqLite(configuration);
-            configuration.ConnectionFactory = new DbConnectionFactory<SqliteConnection>(connectionString, shareConnection);
+            configuration.SqlDialect = new SqliteDialect();
+            configuration.CommandInterpreter = new SqliteCommandInterpreter(configuration);
+            configuration.ConnectionFactory = new DbConnectionFactory<SqliteConnection>(connectionString);
             configuration.IsolationLevel = isolationLevel;
 
             return configuration;

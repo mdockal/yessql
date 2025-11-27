@@ -1,543 +1,1114 @@
 using Dapper;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
+using System.Diagnostics;
 using System.Linq;
 using System.Linq.Expressions;
+using System.Threading;
 using System.Threading.Tasks;
-using YesSql.Collections;
 using YesSql.Commands;
 using YesSql.Data;
 using YesSql.Indexes;
-using YesSql.Serialization;
 using YesSql.Services;
 
 namespace YesSql
 {
     public class Session : ISession
     {
-        private IDbTransaction _transaction;
+        private DbConnection _connection;
+        private DbTransaction _transaction;
 
-        private readonly IdentityMap _identityMap = new IdentityMap();
-        private readonly List<IIndexCommand> _commands = new List<IIndexCommand>();
-        private readonly IDictionary<IndexDescriptor, IList<MapState>> _maps = new Dictionary<IndexDescriptor, IList<MapState>>();
-        private readonly HashSet<object> _saved = new HashSet<object>();
-        private readonly HashSet<object> _updated = new HashSet<object>();
-        private readonly HashSet<object> _deleted = new HashSet<object>();
-        protected readonly Dictionary<string, IEnumerable<IndexDescriptor>> _descriptors = new Dictionary<string, IEnumerable<IndexDescriptor>>();
+        internal List<IIndexCommand> _commands;
+        private readonly Dictionary<string, SessionState> _collectionStates;
+        private readonly SessionState _defaultState;
+        private Dictionary<string, IEnumerable<IndexDescriptor>> _descriptors;
         internal readonly Store _store;
         private volatile bool _disposed;
-        private IsolationLevel _isolationLevel;
-        private DbConnection _connection;
-        private ISqlDialect _dialect;
+        private bool _flushing;
         protected bool _cancel;
+        protected bool _save;
         protected List<IIndexProvider> _indexes;
-        protected string _tablePrefix;
 
-        public Session(Store store, IsolationLevel isolationLevel)
+        protected string _tablePrefix;
+        private readonly ISqlDialect _dialect;
+        private readonly ILogger _logger;
+        private readonly bool _withTracking;
+
+        private readonly bool _enableThreadSafetyChecks;
+        private int _asyncOperations = 0;
+        private string _previousStackTrace = null;
+
+        public Session(Store store, bool withTracking = true)
         {
             _store = store;
-            _isolationLevel = isolationLevel;
             _tablePrefix = _store.Configuration.TablePrefix;
+            _dialect = store.Dialect;
+            _logger = store.Configuration.Logger;
+            _withTracking = withTracking;
+            _defaultState = new SessionState();
+            _enableThreadSafetyChecks = _store.Configuration.EnableThreadSafetyChecks;
+            _collectionStates = new Dictionary<string, SessionState>()
+            {
+                [string.Empty] = _defaultState
+            };
         }
 
-        public ISession RegisterIndexes(params IIndexProvider[] indexProviders)
+        public ISession RegisterIndexes(IIndexProvider[] indexProviders, string collection = null)
         {
             foreach (var indexProvider in indexProviders)
             {
-                if (indexProvider.CollectionName == null)
-                {
-                    indexProvider.CollectionName = CollectionHelper.Current.GetSafeName();
-                }
+                indexProvider.CollectionName ??= collection ?? string.Empty;
             }
 
-            if (_indexes == null)
-            {
-                _indexes = new List<IIndexProvider>();
-            }
+            _indexes ??= [];
 
             _indexes.AddRange(indexProviders);
 
             return this;
         }
 
-        public void Save(object entity)
+        private SessionState GetState(string collection)
         {
+            if (string.IsNullOrEmpty(collection))
+            {
+                return _defaultState;
+            }
+
+            if (!_collectionStates.TryGetValue(collection, out var state))
+            {
+                state = new SessionState();
+                _collectionStates[collection] = state;
+            }
+
+            return state;
+        }
+
+        public async Task SaveAsync(object entity, bool checkConcurrency = false, string collection = null, CancellationToken cancellationToken = default)
+        {
+            var state = GetState(collection);
+
             CheckDisposed();
 
-            // already being saved or updated?
-            if (_saved.Contains(entity) || _updated.Contains(entity))
+            // already being saved or updated or tracked?
+            if (state.Saved.Contains(entity) || state.Updated.Contains(entity))
             {
                 return;
             }
 
+            // remove from tracked entities if explicitly saved
+            state.Tracked.Remove(entity);
+
             // is it a new object?
-            if (_identityMap.TryGetDocumentId(entity, out var id))
+            if (state.IdentityMap.TryGetDocumentId(entity, out var id))
             {
-                _updated.Add(entity);
+                state.Updated.Add(entity);
+
+                // If this entity needs to be checked for concurrency, track its version
+                if (checkConcurrency || _store.Configuration.ConcurrentTypes.Contains(entity.GetType()))
+                {
+                    state.Concurrent.Add(id);
+                }
+
                 return;
             }
 
             // Does it have a valid identifier?
-            var accessor = _store.GetIdAccessor(entity.GetType(), "Id");
+            var accessor = _store.GetIdAccessor(entity.GetType());
             if (accessor != null)
             {
                 id = accessor.Get(entity);
 
                 if (id > 0)
                 {
-                    _identityMap.Add(id, entity);
-                    _updated.Add(entity);
+                    // If we got an object from a different identity map, without change tracking, the object reference could be different than
+                    // the one in the identity map, and the previous state.IdentityMap.TryGetDocumentId would have returned false.
+                    // In this case we need to assume it's an updated object and not try to "Add" it to the identity map.
+
+                    if (state.IdentityMap.TryGetEntityById(id, out var _))
+                    {
+                        throw new InvalidOperationException("An object with the same identity is already part of this transaction. Reload it before doing any changes on it.");
+                    }
+
+                    state.IdentityMap.AddEntity(id, entity);
+                    state.Updated.Add(entity);
+
+                    // If this entity needs to be checked for concurrency, track its version
+                    if (checkConcurrency || _store.Configuration.ConcurrentTypes.Contains(entity.GetType()))
+                    {
+                        state.Concurrent.Add(id);
+                    }
+
                     return;
                 }
             }
 
-            // Then assign a new identifier if it has one
-            if (accessor != null)
-            {
-                // it's a new entity
-                var collection = CollectionHelper.Current.GetSafeName();
-                id = _store.GetNextId(this, collection);
-                accessor.Set(entity, id);
-                _identityMap.Add(id, entity);
-            }
+            // It's a new entity
+            id = await _store.GetNextIdAsync(collection, cancellationToken);
+            state.IdentityMap.AddEntity(id, entity);
 
-            _saved.Add(entity);
+            // Then assign a new identifier if it has one
+            accessor?.Set(entity, id);
+
+            state.Saved.Add(entity);
         }
 
-        public bool Import(object entity, int id = 0)
+        public Task SaveAsync(object entity, bool checkConcurrency, string collection)
+            => SaveAsync(entity, checkConcurrency, collection, CancellationToken.None);
+
+        public Task SaveAsync(object entity, bool checkConcurrency)
+            => SaveAsync(entity, checkConcurrency, null, CancellationToken.None);
+
+        public Task SaveAsync(object entity)
+            => SaveAsync(entity, false, null, CancellationToken.None);
+
+        public bool Import(object entity, long id = 0, long version = 0, string collection = null)
         {
             CheckDisposed();
 
+            var state = GetState(collection);
+
             // already known?
-            if (_saved.Contains(entity) || _updated.Contains(entity))
+            if (state.IdentityMap.HasEntity(entity))
             {
                 return false;
             }
 
+            var doc = new Document
+            {
+                Type = Store.TypeNames[entity.GetType()],
+                Content = Store.Configuration.ContentSerializer.Serialize(entity)
+            };
+
+            // Import version
+            if (version != 0)
+            {
+                doc.Version = version;
+            }
+            else
+            {
+                var versionAccessor = _store.GetVersionAccessor(entity.GetType());
+                if (versionAccessor != null)
+                {
+                    doc.Version = versionAccessor.Get(entity);
+                }
+            }
+
             if (id != 0)
             {
-                _identityMap.Add(id, entity);
-                _updated.Add(entity);
+                state.IdentityMap.AddEntity(id, entity);
+                state.Updated.Add(entity);
+
+                doc.Id = id;
+                state.IdentityMap.AddDocument(doc);
 
                 return true;
             }
             else
             {
                 // Does it have a valid identifier?
-                var accessor = _store.GetIdAccessor(entity.GetType(), "Id");
+                var accessor = _store.GetIdAccessor(entity.GetType());
                 if (accessor != null)
                 {
                     id = accessor.Get(entity);
 
                     if (id > 0)
                     {
-                        _identityMap.Add(id, entity);
-                        _updated.Add(entity);
+                        state.IdentityMap.AddEntity(id, entity);
+                        state.Updated.Add(entity);
+
+                        doc.Id = id;
+                        state.IdentityMap.AddDocument(doc);
+
                         return true;
                     }
-                    else
-                    {
-                        throw new InvalidOperationException($"Invalid 'Id' value: {id}");
-                    }
+
+                    throw new InvalidOperationException($"Invalid 'Id' value: {id}");
                 }
-                else
-                {
-                    throw new InvalidOperationException("Objects without an 'Id' property can't be imported if no 'id' argument is provided.");
-                }
+
+                throw new InvalidOperationException("Objects without an 'Id' property can't be imported if no 'id' argument is provided.");
             }
         }
 
-        private async Task SaveEntityAsync(object entity)
+        public void Detach(object entity, string collection)
         {
-            if (entity == null)
+            CheckDisposed();
+
+            var state = GetState(collection);
+
+            DetachInternal(entity, state);
+        }
+
+        public void Detach(IEnumerable<object> entries, string collection)
+        {
+            CheckDisposed();
+
+            var state = GetState(collection);
+
+            foreach (var entry in entries)
             {
-                throw new ArgumentNullException("obj");
+                DetachInternal(entry, state);
+            }
+        }
+
+        public void DetachAll(string collection)
+        {
+            CheckDisposed();
+
+            var state = GetState(collection);
+
+            state._concurrent?.Clear();
+            state._saved?.Clear();
+            state._updated?.Clear();
+            state._tracked?.Clear();
+            state._deleted?.Clear();
+            state._identityMap?.Clear();
+        }
+
+        public async Task ResetAsync()
+        {
+            CheckDisposed();
+
+            await ReleaseTransactionAsync();
+            await ReleaseConnectionAsync();
+        }
+
+        private static void DetachInternal(object entity, SessionState state)
+        {
+            state.Saved.Remove(entity);
+            state.Updated.Remove(entity);
+            state.Tracked.Remove(entity);
+            state.Deleted.Remove(entity);
+
+            if (state.IdentityMap.TryGetDocumentId(entity, out var id))
+            {
+                state.IdentityMap.Remove(id, entity);
+            }
+        }
+
+        private async Task SaveEntityAsync(object entity, string collection, CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(entity);
+
+            if (entity is Document)
+            {
+                throw new ArgumentException("A document should not be saved explicitly");
             }
 
-            if (entity is Document document)
+            if (entity is IIndex)
             {
-                throw new ArgumentException("A document should not be saved explicitely");
+                throw new ArgumentException("An index should not be saved explicitly");
             }
 
-            if (entity is IIndex index)
-            {
-                throw new ArgumentException("An index should not be saved explicitely");
-            }
+            var state = GetState(collection);
 
             var doc = new Document
             {
-                Type = entity.GetType().SimplifiedTypeName()
+                Type = Store.TypeNames[entity.GetType()]
             };
 
-            // Get the entity's Id if assigned
-            var accessor = _store.GetIdAccessor(entity.GetType(), "Id");
-            if (accessor != null)
+            if (!state.IdentityMap.TryGetDocumentId(entity, out var id))
             {
-                doc.Id = accessor.Get(entity);
-            }
-            else
-            {
-                var collection = CollectionHelper.Current.GetSafeName();
-                doc.Id = _store.GetNextId(this, collection);
+                throw new InvalidOperationException("The object to save was not found in identity map.");
             }
 
-            await DemandAsync();
+            doc.Id = id;
+
+            await CreateConnectionAsync(cancellationToken);
+
+            var versionAccessor = _store.GetVersionAccessor(entity.GetType());
+            if (versionAccessor != null)
+            {
+                doc.Version = versionAccessor.Get(entity);
+            }
+
+            if (doc.Version == 0)
+            {
+                doc.Version = 1;
+            }
+
+            versionAccessor?.Set(entity, doc.Version);
 
             doc.Content = Store.Configuration.ContentSerializer.Serialize(entity);
 
-            await new CreateDocumentCommand(doc, _tablePrefix).ExecuteAsync(_connection, _transaction, _dialect);
+            _commands ??= [];
 
-            await MapNew(doc, entity);
+            _commands.Add(new CreateDocumentCommand(doc, Store, collection));
+
+            state.IdentityMap.AddDocument(doc);
+
+            await MapNew(doc, entity, collection, cancellationToken);
         }
 
-        private async Task UpdateEntityAsync(object entity)
+        private async Task UpdateEntityAsync(object entity, bool tracked, string collection, CancellationToken cancellationToken = default)
         {
-            if (entity == null)
+            ArgumentNullException.ThrowIfNull(entity);
+
+            if (entity is Document)
             {
-                throw new ArgumentNullException("obj");
+                throw new ArgumentException("A document should not be saved explicitly");
             }
 
-            var index = entity as IIndex;
-
-            if (entity is Document document)
+            if (entity is IIndex)
             {
-                throw new ArgumentException("A document should not be saved explicitely");
+                throw new ArgumentException("An index should not be saved explicitly");
             }
 
-            if (index != null)
-            {
-                throw new ArgumentException("An index should not be saved explicitely");
-            }
+            var state = GetState(collection);
 
             // Reload to get the old map
-            if (!_identityMap.TryGetDocumentId(entity, out var id))
+            if (!state.IdentityMap.TryGetDocumentId(entity, out var id))
             {
                 throw new InvalidOperationException("The object to update was not found in identity map.");
             }
 
-            var oldDoc = await GetDocumentByIdAsync(id);
-
-            if (oldDoc == null)
+            if (!state.IdentityMap.TryGetDocument(id, out var oldDoc))
             {
-                throw new InvalidOperationException("Incorrect attempt to update an object that doesn't exist. Ensure a new object was not saved with an identifier value.");
+                oldDoc = await GetDocumentByIdAsync(id, collection, cancellationToken);
+
+                if (oldDoc == null)
+                {
+                    throw new InvalidOperationException("Incorrect attempt to update an object that doesn't exist. Ensure a new object was not saved with an identifier value.");
+                }
+            }
+
+            var newContent = Store.Configuration.ContentSerializer.Serialize(entity);
+
+            // if the document has already been updated or saved with this session (auto or intentional flush), ensure it has 
+            // been changed before doing another query
+            if (tracked && string.Equals(newContent, oldDoc.Content, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            long version = -1;
+
+            if (state.Concurrent.Contains(id))
+            {
+                version = oldDoc.Version;
+
+                var versionAccessor = _store.GetVersionAccessor(entity.GetType());
+                if (versionAccessor != null)
+                {
+                    var localVersion = versionAccessor.Get(entity);
+
+                    // if the version has been set, use it
+                    if (localVersion != 0)
+                    {
+                        version = localVersion;
+                    }
+                }
+
+                oldDoc.Version += 1;
+
+                // apply the new version to the object
+                if (versionAccessor != null)
+                {
+                    versionAccessor.Set(entity, oldDoc.Version);
+
+                    newContent = Store.Configuration.ContentSerializer.Serialize(entity);
+                }
             }
 
             var oldObj = Store.Configuration.ContentSerializer.Deserialize(oldDoc.Content, entity.GetType());
 
             // Update map index
-            await MapDeleted(oldDoc, oldObj);
+            await MapDeleted(oldDoc, oldObj, collection, cancellationToken);
 
-            await MapNew(oldDoc, entity);
+            await MapNew(oldDoc, entity, collection, cancellationToken);
 
-            await DemandAsync();
+            await CreateConnectionAsync(cancellationToken);
 
-            oldDoc.Content = Store.Configuration.ContentSerializer.Serialize(entity);
-            await new UpdateDocumentCommand(oldDoc, Store.Configuration.TablePrefix).ExecuteAsync(_connection, _transaction, _dialect);
+            oldDoc.Content = newContent;
+
+            _commands ??= [];
+
+            _commands.Add(new UpdateDocumentCommand(oldDoc, Store, version, collection));
         }
 
-        private async Task<Document> GetDocumentByIdAsync(int id)
+        private async Task<Document> GetDocumentByIdAsync(long id, string collection, CancellationToken cancellationToken = default)
         {
-            await DemandAsync();
+            await CreateConnectionAsync(cancellationToken);
 
-            var documentTable = CollectionHelper.Current.GetPrefixedName(YesSql.Store.DocumentTable);
+            var documentTable = Store.Configuration.TableNameConvention.GetDocumentTable(collection);
 
-            var command = "select * from " + _dialect.QuoteForTableName(_tablePrefix + documentTable) + " where " + _dialect.QuoteForColumnName("Id") + " = @Id";
-            var key = new WorkerQueryKey(nameof(GetDocumentByIdAsync), new [] { id });
-            var result = await _store.ProduceAsync(key, () => _connection.QueryAsync<Document>(command, new { Id = id }, _transaction));
+            var command = "select * from " + _dialect.QuoteForTableName(_tablePrefix + documentTable, Store.Configuration.Schema) + " where " + _dialect.QuoteForColumnName("Id") + " = @Id";
+            var key = new WorkerQueryKey(nameof(GetDocumentByIdAsync), id);
 
-            return result.FirstOrDefault();
+            try
+            {
+                var result = await _store.ProduceAsync(key, static (key, state) =>
+                {
+                    var logger = state.Store.Configuration.Logger;
+
+                    if (logger.IsEnabled(LogLevel.Trace))
+                    {
+                        logger.LogTrace(state.Command);
+                    }
+
+                    return state.Connection.QueryAsync<Document>(new CommandDefinition(state.Command, state.Parameters, state.Transaction, null, null, CommandFlags.Buffered, cancellationToken: state.CancellationToken));
+                },
+                new { Store = _store, Connection = _connection, Transaction = _transaction, Command = command, Parameters = new { Id = id }, CancellationToken = cancellationToken });
+
+                // Clone documents returned from ProduceAsync as they might be shared across sessions
+                return result.FirstOrDefault()?.Clone();
+            }
+            catch
+            {
+                await CancelAsync();
+
+                throw;
+            }
         }
 
-        public void Delete(object obj)
+        public void Delete(object obj, string collection = null)
         {
             CheckDisposed();
 
-            _deleted.Add(obj);
+            var state = GetState(collection);
+
+            if (state.Saved.Remove(obj))
+            {
+                Debug.Assert(!state.Updated.Contains(obj));
+
+                // If the item is in the Saved, this means its a brand new object.
+                // Remove it from the memory and don't add it to the Deleted collection.
+
+                if (state.IdentityMap.TryGetDocumentId(obj, out var id))
+                {
+                    state.IdentityMap.Remove(id, obj);
+                }
+
+                // Ensure we reset the Id of the object to allow it to be added later if needed.
+                var accessor = _store.GetIdAccessor(obj.GetType());
+
+                if (accessor is not null)
+                {
+                    accessor.Set(obj, 0);
+                }
+
+                return;
+            }
+
+            state.Deleted.Add(obj);
         }
 
-        private async Task DeleteEntityAsync(object obj)
+        private async Task DeleteEntityAsync(object obj, string collection, CancellationToken cancellationToken = default)
         {
-            if (obj == null)
-            {
-                throw new ArgumentNullException("obj");
-            }
-            else if (obj is IIndex)
+            ArgumentNullException.ThrowIfNull(obj);
+
+            if (obj is IIndex)
             {
                 throw new ArgumentException("Can't call DeleteEntity on an Index");
             }
-            else
+
+            var state = GetState(collection);
+
+            if (!state.IdentityMap.TryGetDocumentId(obj, out var id))
             {
-                if (!_identityMap.TryGetDocumentId(obj, out var id))
-                {
-                    var accessor = _store.GetIdAccessor(obj.GetType(), "Id");
-                    if (accessor == null)
-                    {
-                        throw new InvalidOperationException("Could not delete object as it doesn't have an Id property");
-                    }
+                var accessor = _store.GetIdAccessor(obj.GetType())
+                    ?? throw new InvalidOperationException("Could not delete object as it doesn't have an Id property");
 
-                    id = accessor.Get(obj);
-                }
+                id = accessor.Get(obj);
+            }
 
-                var doc = await GetDocumentByIdAsync(id);
+            var doc = await GetDocumentByIdAsync(id, collection, cancellationToken);
 
-                if (doc != null)
-                {
-                    // Untrack the deleted object
-                    _identityMap.Remove(id, obj);
+            if (doc != null)
+            {
+                // Untrack the deleted object
+                state.IdentityMap.Remove(id, obj);
 
-                    // Update impacted indexes
-                    await MapDeleted(doc, obj);
+                // Update impacted indexes
+                await MapDeleted(doc, obj, collection, cancellationToken);
 
-                    // The command needs to come after any index deletiong because of the database constraints
-                    _commands.Add(new DeleteDocumentCommand(doc, _tablePrefix));
-                }
+                _commands ??= [];
+
+                // The command needs to come after any index deletion because of the database constraints
+                _commands.Add(new DeleteDocumentCommand(doc, Store, collection));
             }
         }
 
-        public async Task<IEnumerable<T>> GetAsync<T>(int[] ids) where T : class
+        public async Task<IEnumerable<T>> GetAsync<T>(long[] ids, string collection = null, CancellationToken cancellationToken = default) where T : class
         {
-            if (ids == null || !ids.Any())
+            if (ids?.Length == 0)
             {
-                return Enumerable.Empty<T>();
+                return [];
             }
 
             CheckDisposed();
 
             // Auto-flush
-            await CommitAsync();
+            await FlushAsync(cancellationToken);
 
-            await DemandAsync();
+            await CreateConnectionAsync(cancellationToken);
 
-            var documentTable = CollectionHelper.Current.GetPrefixedName(YesSql.Store.DocumentTable);
-            var command = "select * from " + _dialect.QuoteForTableName(_tablePrefix + documentTable) + " where " + _dialect.QuoteForColumnName("Id") + " " + _dialect.InOperator("@Ids");
+            var documentTable = Store.Configuration.TableNameConvention.GetDocumentTable(collection);
+
+            var command = "select * from " + _dialect.QuoteForTableName(_tablePrefix + documentTable, _store.Configuration.Schema) + " where " + _dialect.QuoteForColumnName("Id") + " " + _dialect.InOperator("@Ids");
 
             var key = new WorkerQueryKey(nameof(GetAsync), ids);
-            var documents = await _store.ProduceAsync(key, () =>
+            try
             {
-                return _connection.QueryAsync<Document>(command, new { Ids = ids }, _transaction);
-            });
-
-            return Get<T>(documents.ToArray());
-        }
-
-        public IEnumerable<T> Get<T>(IList<Document> documents) where T : class
-        {
-            if (documents == null || !documents.Any())
-            {
-                return Enumerable.Empty<T>();
-            }
-
-            var result = new List<T>();
-
-            var accessor = _store.GetIdAccessor(typeof(T), "Id");
-            var typeName = typeof(T).SimplifiedTypeName();
-
-            // Are all the objects already in cache?
-            foreach (var d in documents)
-            {
-                if (typeof(T) != typeof(object) && !String.Equals(typeName, d.Type, StringComparison.Ordinal))
+                var documents = await _store.ProduceAsync(key, static (key, state) =>
                 {
-                    continue;
+                    var logger = state.Store.Configuration.Logger;
+
+                    if (logger.IsEnabled(LogLevel.Trace))
+                    {
+                        logger.LogTrace(state.Command);
+                    }
+
+                    return state.Connection.QueryAsync<Document>(new CommandDefinition(state.Command, state.Parameters, state.Transaction, null, null, CommandFlags.Buffered, cancellationToken: state.CancellationToken));
+                },
+                new
+                {
+                    Store = _store,
+                    Connection = _connection,
+                    Transaction = _transaction,
+                    Command = command,
+                    Parameters = new { Ids = ids },
+                    CancellationToken = cancellationToken,
+                });
+
+                if (!documents.Any())
+                {
+                    return [];
                 }
 
-                if (_identityMap.TryGetEntityById(d.Id, out var entity))
+                // Clone documents returned from ProduceAsync as they might be shared across sessions
+                var sortedDocuments = documents.Select(x => x.Clone())
+                    .OrderBy(d => Array.IndexOf(ids, d.Id));
+
+                return Get<T>(sortedDocuments, collection)
+                    .ToArray();
+            }
+            catch
+            {
+                await CancelAsync();
+
+                throw;
+            }
+        }
+
+        internal IEnumerable<T> Get<T>(IEnumerable<Document> documents, string collection) where T : class
+        {
+            var defaultAccessor = _store.GetIdAccessor(typeof(T));
+            var typeName = Store.TypeNames[typeof(T)];
+
+            var state = GetState(collection);
+
+            // Are all the objects already in cache?
+            foreach (var document in documents)
+            {
+                if (_withTracking && state.IdentityMap.TryGetEntityById(document.Id, out var entity))
                 {
-                    result.Add((T)entity);
+                    yield return (T)entity;
                 }
                 else
                 {
                     T item;
 
-                    // If no type is specified, use the one from the document
-                    if (typeof(T) == typeof(object))
+                    IAccessor<long> accessor;
+                    // If the document type doesn't match the requested one, check it's a base type
+                    if (!string.Equals(typeName, document.Type, StringComparison.Ordinal))
                     {
-                        var itemType = Type.GetType(d.Type) ?? typeof(object);
-                        accessor = _store.GetIdAccessor(itemType, "Id");
+                        var itemType = Store.TypeNames[document.Type];
 
-                        item = (T)Store.Configuration.ContentSerializer.Deserialize(d.Content, itemType);
+                        // Ignore the document if it can't be casted to the requested type
+                        if (!typeof(T).IsAssignableFrom(itemType))
+                        {
+                            continue;
+                        }
+
+                        accessor = _store.GetIdAccessor(itemType);
+
+                        item = (T)Store.Configuration.ContentSerializer.Deserialize(document.Content, itemType);
                     }
                     else
                     {
-                        item = (T)Store.Configuration.ContentSerializer.Deserialize(d.Content, typeof(T));
+                        item = (T)Store.Configuration.ContentSerializer.Deserialize(document.Content, typeof(T));
+
+                        accessor = defaultAccessor;
                     }
 
-                    if (accessor != null)
+                    accessor?.Set(item, document.Id);
+
+                    if (_withTracking)
                     {
-                        accessor.Set(item, d.Id);
+                        // track the loaded object.
+                        state.IdentityMap.AddEntity(document.Id, item);
+                        state.IdentityMap.AddDocument(document);
                     }
 
-                    // track the loaded object
-                    _identityMap.Add(d.Id, item);
-
-                    result.Add(item);
+                    yield return item;
                 }
-            };
-            
-            return result;
-        }
-
-        public IQuery Query()
-        {
-            return new DefaultQuery(_connection, _transaction, this, _tablePrefix);
-        }
-
-        public IQuery<T> ExecuteQuery<T>(ICompiledQuery<T> compiledQuery) where T : class
-        {
-            if (compiledQuery == null)
-            {
-                throw new ArgumentNullException(nameof(compiledQuery));
             }
+        }
 
-            var queryState = _store.CompiledQueries.GetOrAdd(compiledQuery.GetType(), t =>
+        public Task<IEnumerable<T>> GetAsync<T>(long[] ids, string collection) where T : class
+            => GetAsync<T>(ids, collection, CancellationToken.None);
+
+        public Task<IEnumerable<T>> GetAsync<T>(long[] ids) where T : class
+            => GetAsync<T>(ids, null, CancellationToken.None);
+
+        public IQuery Query(string collection = null)
+        {
+            return new DefaultQuery(this, _tablePrefix, collection);
+        }
+
+        public IQuery<T> ExecuteQuery<T>(ICompiledQuery<T> compiledQuery, string collection = null) where T : class
+        {
+            ArgumentNullException.ThrowIfNull(compiledQuery);
+
+            var compiledQueryType = compiledQuery.GetType();
+
+            var discriminator = NullableThumbprintFactory.GetNullableThumbprint(compiledQuery);
+
+            var queryState = _store.CompiledQueries.GetOrAdd(discriminator, discriminator =>
             {
-                var localQuery = ((IQuery)new DefaultQuery(_connection, _transaction, this, _tablePrefix)).For<T>(false);
+                var localQuery = ((IQuery)new DefaultQuery(this, _tablePrefix, collection)).For<T>(false);
                 var defaultQuery = (DefaultQuery.Query<T>)compiledQuery.Query().Compile().Invoke(localQuery);
-                
                 return defaultQuery._query._queryState;
-            });
+            })
+            .Clone();
 
-            queryState = queryState.Clone();
-
-            IQuery newQuery = new DefaultQuery(_connection, _transaction, this, _tablePrefix, queryState, compiledQuery);
+            IQuery newQuery = new DefaultQuery(this, queryState, compiledQuery);
             return newQuery.For<T>(false);
         }
 
         private void CheckDisposed()
         {
+#pragma warning disable CA1513 // Use ObjectDisposedException throw helper
             if (_disposed)
             {
                 throw new ObjectDisposedException(nameof(Session));
             }
+#pragma warning restore CA1513 // Use ObjectDisposedException throw helper
+        }
+
+        ~Session()
+        {
+            // Ensure the session gets disposed if the user cannot wrap the session in a using block.
+            // For instance in OrchardCore the session is disposed from a middleware, so if an exception
+            // is thrown in a middleware, it might not get triggered.
+            Dispose(false);
+        }
+
+        public void Dispose(bool _)
+        {
+            // Do nothing if Dispose() was already called
+            if (!_disposed)
+            {
+                try
+                {
+                    CommitOrRollbackTransactionAsync().GetAwaiter().GetResult();
+                }
+                catch
+                {
+                    _connection = null;
+                    _transaction = null;
+                }
+            }
+
+            _disposed = true;
         }
 
         public void Dispose()
         {
-            if (_disposed)
-            {
-                return;
-            }
+            Dispose(true);
 
-            try
-            {
-                if (!_cancel)
-                {
-                    if (HasWork())
-                    {
-                        // Execute pending commands. This is a sync call over async
-                        // which is not recommended. Prefer to call CommitAsync() before 
-                        // disposing the session.
-
-                        CommitAsync().Wait();
-                    }
-
-                    if (_transaction != null)
-                    {
-                        _transaction.Commit();
-                    }
-                }
-                else
-                {
-                    if (_transaction != null)
-                    {
-                        _transaction.Rollback();
-                    }
-                }
-            }
-            finally
-            {
-                _disposed = true;
-
-                if (_transaction != null)
-                {
-                    _transaction.Dispose();
-                    _transaction = null;
-                }
-
-                if (_connection != null)
-                {
-                    _store.Configuration.ConnectionFactory.CloseConnection(_connection);
-                    _connection = null;
-                }
-
-                Release();
-            }            
+            GC.SuppressFinalize(this);
         }
 
-        /// <summary>
-        /// Called when the instance is available to an object pool.
-        /// </summary>
-        internal void Release()
+        public Task FlushAsync(CancellationToken cancellationToken = default)
         {
-            _updated.Clear();
-            _saved.Clear();
-            _deleted.Clear();
-            _commands.Clear();
-            _maps.Clear();
-
-            _identityMap.Clear();
-            _descriptors.Clear();
-            _indexes?.Clear();
-            _store.ReleaseSession(this);
+            return FlushInternalAsync(false, cancellationToken);
         }
 
-        /// <summary>
-        /// Called when the instance is reused from an object pool and doesn't go
-        /// through the constructor.
-        /// </summary>
-        internal void StartLease(IsolationLevel isolationLevel)
-        {
-            _disposed = false;
-            _cancel = false;
-            _isolationLevel = isolationLevel;
-        }
+        public Task FlushAsync()
+            => FlushAsync(CancellationToken.None);
 
-        public async Task CommitAsync()
+        private async Task FlushInternalAsync(bool saving, CancellationToken cancellationToken)
         {
-            CheckDisposed();
-
             if (!HasWork())
             {
                 return;
             }
 
-            // saving all updated entities
-            foreach (var obj in _updated)
+            // prevent recursive calls in FlushAsync,
+            // when auto-flush is triggered from an IndexProvider
+            // for instance.
+
+            if (_flushing)
             {
-                if (!_deleted.Contains(obj))
+                return;
+            }
+
+            _flushing = true;
+
+            // we only check if the session is disposed if 
+            // there are no commands to commit.
+
+            CheckDisposed();
+
+            // Only check thread-safety if not called from SaveChangesAsync
+            if (!saving)
+            {
+                EnterAsyncExecution();
+            }
+
+            try
+            {
+                // saving all tracked entities
+                foreach (var collectionState in _collectionStates)
                 {
-                    await UpdateEntityAsync(obj);
+                    var state = collectionState.Value;
+                    var collection = collectionState.Key;
+
+                    foreach (var obj in state.Tracked)
+                    {
+                        if (!state.Deleted.Contains(obj))
+                        {
+                            await UpdateEntityAsync(obj, true, collection, cancellationToken);
+                        }
+                    }
+
+                    // saving all updated entities
+                    foreach (var obj in state.Updated)
+                    {
+                        if (!state.Deleted.Contains(obj))
+                        {
+                            await UpdateEntityAsync(obj, false, collection, cancellationToken);
+                        }
+                    }
+
+                    // saving all pending entities
+                    foreach (var obj in state.Saved)
+                    {
+                        await SaveEntityAsync(obj, collection, cancellationToken);
+                    }
+
+                    // deleting all pending entities
+                    foreach (var obj in state.Deleted)
+                    {
+                        await DeleteEntityAsync(obj, collection, cancellationToken);
+                    }
+                }
+
+                // compute all reduce indexes
+                await ReduceAsync(cancellationToken);
+
+                await BeginTransactionAsync(cancellationToken);
+
+                BatchCommands();
+
+                if (_commands != null)
+                {
+                    foreach (var command in _commands)
+                    {
+                        await command.ExecuteAsync(_connection, _transaction, _dialect, _logger, cancellationToken);
+                    }
                 }
             }
-
-            // saving all pending entities
-            foreach (var obj in _saved)
+            catch
             {
-                await SaveEntityAsync(obj);
+                // Don't use CancelAsync as we don't want to trigger a thread safety check, it's done in the finally block
+                await CancelAsyncInternal();
+
+                throw;
+            }
+            finally
+            {
+                foreach (var state in _collectionStates.Values)
+                {
+                    // Track all saved and updated entities in case they are modified before
+                    // CommitAsync is called
+                    foreach (var saved in state.Saved)
+                    {
+                        state.Tracked.Add(saved);
+                    }
+
+                    foreach (var updated in state.Updated)
+                    {
+                        state.Tracked.Add(updated);
+                    }
+
+                    state.Saved.Clear();
+                    state.Updated.Clear();
+                    state.Deleted.Clear();
+                    state.Maps.Clear();
+                }
+
+                _commands?.Clear();
+                _flushing = false;
+
+                // Only check thread-safety if not called from SaveChangesAsync
+                if (!saving)
+                {
+                    ExitAsyncExecution();
+                }
+            }
+        }
+
+        private void BatchCommands()
+        {
+            if (_commands is null || _commands.Count == 0)
+            {
+                return;
             }
 
-            // deleting all pending entities
-            foreach (var obj in _deleted)
+            if (!_dialect.SupportsBatching || _store.Configuration.CommandsPageSize == 0)
             {
-                await DeleteEntityAsync(obj);
+                return;
             }
 
-            // compute all reduce indexes
-            await ReduceAsync();
+            var batches = new List<IIndexCommand>();
 
-            await DemandAsync();
-            
+            // holds the queries, parameters and actions returned by an IIndexCommand, until we know we can
+            // add it to a batch if it fits the limits (page size and parameters boundaries)
+            var localDbCommand = _connection.CreateCommand();
+            var localQueries = new List<string>();
+            var localActions = new List<Action<DbDataReader>>();
+
+            var batch = new BatchCommand(_connection.CreateCommand());
+            var index = 0;
+
             foreach (var command in _commands.OrderBy(x => x.ExecutionOrder))
             {
-                await command.ExecuteAsync(_connection, _transaction, _dialect);
+                index++;
+
+                // Can the command be batched
+                if (command.AddToBatch(_dialect, localQueries, localDbCommand, localActions, index))
+                {
+                    // Does it go over the page or parameters limits
+
+                    var tooManyQueries = batch.Queries.Count + localQueries.Count > _store.Configuration.CommandsPageSize;
+                    var tooManyCommands = batch.Command.Parameters.Count + localDbCommand.Parameters.Count > _store.Configuration.SqlDialect.MaxParametersPerCommand;
+
+                    if (tooManyQueries || tooManyCommands)
+                    {
+                        batches.Add(batch);
+
+                        // Then start a new batch
+                        batch = new BatchCommand(_connection.CreateCommand());
+                    }
+
+                    // We can add the queries to the current batch
+                    batch.Queries.AddRange(localQueries);
+                    batch.Actions.AddRange(localActions);
+                    for (var i = localDbCommand.Parameters.Count - 1; i >= 0; i--)
+                    {
+                        // npgsql will prevent a parameter from being added to a collection
+                        // if it's already in another one
+                        var parameter = localDbCommand.Parameters[i];
+                        localDbCommand.Parameters.RemoveAt(i);
+                        batch.Command.Parameters.Add(parameter);
+                    }
+                }
+                else
+                {
+                    // The command can't be added to a batch, we leave it in the list of commands to execute individually
+
+                    // Finalize the current batch
+                    if (batch.Queries.Count > 0)
+                    {
+                        batches.Add(batch);
+
+                        // Then start a new batch
+                        batch = new BatchCommand(_connection.CreateCommand());
+                    }
+
+                    batches.Add(command);
+                }
+
+                localQueries.Clear();
+                localDbCommand.Parameters.Clear();
+                localActions.Clear();
             }
 
-            _updated.Clear();
-            _saved.Clear();
-            _deleted.Clear();
+            // If the ongoing batch is not empty, add it
+            if (batch.Queries.Count > 0)
+            {
+                batches.Add(batch);
+            }
+
             _commands.Clear();
-            _maps.Clear();
+            _commands.AddRange(batches);
+        }
+
+        public void EnterAsyncExecution()
+        {
+            if (!_enableThreadSafetyChecks)
+            {
+                return;
+            }
+
+            if (Interlocked.Increment(ref _asyncOperations) > 1)
+            {
+                throw new InvalidOperationException($"Two concurrent threads have been detected accessing the same ISession instance from: \n{Environment.StackTrace}\nand:\n{_previousStackTrace}\n---");
+            }
+
+            _previousStackTrace = Environment.StackTrace;
+        }
+
+        public void ExitAsyncExecution()
+        {
+            if (!_enableThreadSafetyChecks)
+            {
+                return;
+            }
+
+            Interlocked.Decrement(ref _asyncOperations);
+        }
+
+        public async Task SaveChangesAsync(CancellationToken cancellationToken = default)
+        {
+            EnterAsyncExecution();
+
+            try
+            {
+                if (!_cancel)
+                {
+                    await FlushInternalAsync(true, cancellationToken);
+
+                    _save = true;
+                }
+            }
+            finally
+            {
+                await CommitOrRollbackTransactionAsync(cancellationToken);
+                ExitAsyncExecution();
+            }
+        }
+
+        public Task SaveChangesAsync()
+            => SaveChangesAsync(CancellationToken.None);
+
+        public async ValueTask DisposeAsync()
+        {
+            // Do nothing if Dispose() was already called
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+
+            try
+            {
+                await CommitOrRollbackTransactionAsync(CancellationToken.None);
+            }
+            catch
+            {
+                _transaction = null;
+                _connection = null;
+            }
+
+            GC.SuppressFinalize(this);
+        }
+
+        private async Task CommitOrRollbackTransactionAsync(CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                if (_transaction != null)
+                {
+                    if (_cancel || !_save)
+                    {
+                        await _transaction.RollbackAsync(cancellationToken);
+
+                        return;
+                    }
+
+                    await _transaction.CommitAsync(cancellationToken);
+                }
+            }
+            finally
+            {
+                await ReleaseConnectionAsync();
+            }
+        }
+
+        /// <summary>
+        /// Clears all the resources associated to the transaction.
+        /// </summary>
+        private async Task ReleaseTransactionAsync()
+        {
+            foreach (var state in _collectionStates.Values)
+            {
+                state._concurrent?.Clear();
+                state._saved?.Clear();
+                state._updated?.Clear();
+                state._tracked?.Clear();
+                state._deleted?.Clear();
+                state._maps?.Clear();
+
+                // Clear the identity map as we don't want to return stale data after committing some changes.
+                // We assume the identity map is part of the unit-of-work.
+                state._identityMap?.Clear();
+            }
+
+            _commands?.Clear();
+            _commands = null;
+
+            if (_transaction != null)
+            {
+                await _transaction.DisposeAsync();
+                _transaction = null;
+            }
+        }
+
+        private async Task ReleaseConnectionAsync()
+        {
+            await ReleaseTransactionAsync();
+
+            if (_connection != null)
+            {
+                await _connection.CloseAsync();
+                await _connection.DisposeAsync();
+                _connection = null;
+            }
+        }
+
+        /// <summary>
+        /// Clears all the resources associated to the transaction.
+        /// </summary>
+        private void ReleaseTransaction()
+        {
+            foreach (var state in _collectionStates.Values)
+            {
+                // IndentityMap is cleared in ReleaseSession()
+                state._concurrent?.Clear();
+                state._saved?.Clear();
+                state._updated?.Clear();
+                state._tracked?.Clear();
+                state._deleted?.Clear();
+                state._maps?.Clear();
+            }
+
+            _commands?.Clear();
+            _commands = null;
+
+            if (_transaction != null)
+            {
+                _transaction.Dispose();
+                _transaction = null;
+            }
+        }
+
+        private void ReleaseConnection()
+        {
+            ReleaseTransaction();
+
+            if (_connection != null)
+            {
+                _connection.Close();
+                _connection.Dispose();
+                _connection = null;
+            }
         }
 
         /// <summary>
@@ -545,156 +1116,170 @@ namespace YesSql
         /// </summary>
         internal bool HasWork()
         {
-            return
-                _saved.Count != 0 ||
-                _updated.Count != 0 ||
-                _deleted.Count != 0
-                ;
+            foreach (var state in _collectionStates.Values)
+            {
+                if (
+                    state.Saved.Count +
+                    state.Updated.Count +
+                    state.Tracked.Count +
+                    state.Deleted.Count > 0
+                    )
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
-        private async Task ReduceAsync()
+        private async Task ReduceAsync(CancellationToken cancellationToken = default)
         {
-            // loop over each Indexer used by new objects
-            foreach (var descriptor in _maps.Keys)
+            foreach (var collectionState in _collectionStates)
             {
-                // if the descriptor has no reduce behavior, ignore it
-                if (descriptor.Reduce == null)
-                    continue;
+                var state = collectionState.Value;
+                var collection = collectionState.Key;
 
-                if (descriptor.GroupKey == null)
+                // loop over each Indexer used by new objects
+                foreach (var descriptor in state.Maps.Keys)
                 {
-                    throw new InvalidOperationException(
-                        "A map/reduce index must declare at least one property with a GroupKey attribute: " +
-                        descriptor.Type.FullName);
-                }
-
-                // a groupping method for the current descriptor
-                var descriptorGroup = GetGroupingMetod(descriptor);
-
-                // list all available grouping keys in the current set
-                var allKeysForDescriptor =
-                    _maps[descriptor].Select(x => x.Map).Select(descriptorGroup).Distinct().ToArray();
-
-                // reduce each group, will result in one Reduced index per group
-                foreach (var currentKey in allKeysForDescriptor)
-                {
-                    // group all mapped indexes
-                    var newMapsGroup =
-                        _maps[descriptor].Where(x => x.State == MapStates.New).Select(x => x.Map).Where(
-                            x => descriptorGroup(x).Equals(currentKey)).ToArray();
-
-                    var deletedMapsGroup =
-                        _maps[descriptor].Where(x => x.State == MapStates.Delete).Select(x => x.Map).Where(
-                            x => descriptorGroup(x).Equals(currentKey)).ToArray();
-                    
-                    var updatedMapsGroup =
-                        _maps[descriptor].Where(x => x.State == MapStates.Update).Select(x => x.Map).Where(
-                            x => descriptorGroup(x).Equals(currentKey)).ToArray();
-
-                    // todo: if an updated object got his Key changed, then apply a New to the new value group
-                    // and a Delete to the old value group. Otherwise apply Update to the current value group
-
-                    IIndex index = null;
-
-                    if (newMapsGroup.Any())
+                    // if the descriptor has no reduce behavior, ignore it
+                    if (descriptor.Reduce == null)
                     {
-                        // reducing an already groupped set (technically the reduction should contain the grouping step, but by design ...)
-                        index = descriptor.Reduce(newMapsGroup.GroupBy(descriptorGroup).First());
-
-                        if (index == null)
-                        {
-                            throw new InvalidOperationException(
-                                "The reduction on a grouped set should have resulted in a unique result"
-                                );
-                        }
+                        continue;
                     }
 
-                    var dbIndex = await ReduceForAsync(descriptor, currentKey);
-
-                    // if index present in db and new objects, reduce them
-                    if (dbIndex != null && index != null)
+                    if (descriptor.GroupKey == null)
                     {
-                        // reduce over the two objects
-                        var reductions = new[] { dbIndex, index };
-
-                        var grouppedReductions = reductions.GroupBy(descriptorGroup).SingleOrDefault();
-
-                        if (grouppedReductions == null)
-                        {
-                            throw new InvalidOperationException(
-                                "The grouping on the db and in memory set should have resulted in a unique result");
-                        }
-
-                        index = descriptor.Reduce(grouppedReductions);
-
-                        if (index == null)
-                        {
-                            throw new InvalidOperationException(
-                                "The reduction on a grouped set should have resulted in a unique result");
-                        }
-                    }
-                    else if (dbIndex != null)
-                    {
-                        index = dbIndex;
+                        throw new InvalidOperationException(
+                            "A map/reduce index must declare at least one property with a GroupKey attribute: " +
+                            descriptor.Type.FullName);
                     }
 
-                    if (index != null)
+                    // a grouping method for the current descriptor
+                    var descriptorGroup = GetGroupingMethod(descriptor);
+
+                    // list all available grouping keys in the current set
+                    var allKeysForDescriptor =
+                        state.Maps[descriptor].Select(x => x.Map).Select(descriptorGroup).Distinct().ToList();
+
+                    // reduce each group, will result in one Reduced index per group
+                    foreach (var currentKey in allKeysForDescriptor)
                     {
-                        // are there any deleted object for this descriptor/group ?
-                        if (deletedMapsGroup.Any())
+                        // group all mapped indexes
+                        var newMapsGroup =
+                            state.Maps[descriptor].Where(x => x.State == MapStates.New).Select(x => x.Map).Where(
+                                x => descriptorGroup(x).Equals(currentKey)).ToList();
+
+                        var deletedMapsGroup =
+                            state.Maps[descriptor].Where(x => x.State == MapStates.Delete).Select(x => x.Map).Where(
+                                x => descriptorGroup(x).Equals(currentKey)).ToList();
+
+                        var updatedMapsGroup =
+                            state.Maps[descriptor].Where(x => x.State == MapStates.Update).Select(x => x.Map).Where(
+                                x => descriptorGroup(x).Equals(currentKey)).ToList();
+
+                        // todo: if an updated object got his Key changed, then apply a New to the new value group
+                        // and a Delete to the old value group. Otherwise apply Update to the current value group
+
+                        IIndex index = null;
+
+                        if (newMapsGroup.Count > 0)
                         {
-                            index = descriptor.Delete(index, deletedMapsGroup.GroupBy(descriptorGroup).First());
-                            // At this point, index can be null if the reduction returned a null index from Delete handler
+                            // reducing an already grouped set (technically the reduction should contain the grouping step, but by design ...)
+                            index = descriptor.Reduce(newMapsGroup.GroupBy(descriptorGroup).First());
+
+                            if (index == null)
+                            {
+                                throw new InvalidOperationException(
+                                    "The reduction on a grouped set should have resulted in a unique result"
+                                    );
+                            }
                         }
 
-                        // are there any updated object for this descriptor/group ?
-                        if (updatedMapsGroup.Any())
+                        var dbIndex = await ReduceForAsync(descriptor, currentKey, collection, cancellationToken);
+
+                        // if index present in db and new objects, reduce them
+                        if (dbIndex != null && index != null)
                         {
-                            index = descriptor.Update(index, updatedMapsGroup.GroupBy(descriptorGroup).First());
+                            // reduce over the two objects
+                            var reductions = new[] { dbIndex, index };
+
+                            var groupedReductions = reductions.GroupBy(descriptorGroup).SingleOrDefault()
+                                ?? throw new InvalidOperationException("The grouping on the db and in memory set should have resulted in a unique result");
+
+                            index = descriptor.Reduce(groupedReductions);
+
+                            if (index == null)
+                            {
+                                throw new InvalidOperationException(
+                                    "The reduction on a grouped set should have resulted in a unique result");
+                            }
                         }
-                    }
-
-                    var deletedDocumentIds = deletedMapsGroup.SelectMany(x => x.GetRemovedDocuments().Select(d => d.Id)).ToArray();
-                    var addedDocumentIds = newMapsGroup.SelectMany(x => x.GetAddedDocuments().Select(d => d.Id)).ToArray();
-
-                    if (dbIndex != null)
-                    {
-                        if (index == null)
+                        else if (dbIndex != null)
                         {
-                            _commands.Add(new DeleteReduceIndexCommand(dbIndex, _tablePrefix));
+                            index = dbIndex;
+                        }
+
+                        if (index != null)
+                        {
+                            // are there any deleted object for this descriptor/group ?
+                            if (deletedMapsGroup.Count > 0)
+                            {
+                                index = descriptor.Delete(index, deletedMapsGroup.GroupBy(descriptorGroup).First());
+                                // At this point, index can be null if the reduction returned a null index from Delete handler
+                            }
+
+                            // are there any updated object for this descriptor/group ?
+                            if (updatedMapsGroup.Count > 0)
+                            {
+                                index = descriptor.Update(index, updatedMapsGroup.GroupBy(descriptorGroup).First());
+                            }
+                        }
+
+                        var deletedDocumentIds = deletedMapsGroup.SelectMany(x => x.GetRemovedDocuments().Select(d => d.Id)).ToList();
+                        var addedDocumentIds = newMapsGroup.SelectMany(x => x.GetAddedDocuments().Select(d => d.Id)).ToList();
+
+                        _commands ??= new List<IIndexCommand>();
+
+                        if (dbIndex != null)
+                        {
+                            if (index == null)
+                            {
+                                _commands.Add(new DeleteReduceIndexCommand(dbIndex, Store, collection));
+                            }
+                            else
+                            {
+                                index.Id = dbIndex.Id;
+
+                                var common = addedDocumentIds.Intersect(deletedDocumentIds).ToList();
+                                addedDocumentIds = addedDocumentIds.Where(x => !common.Contains(x)).ToList();
+                                deletedDocumentIds = deletedDocumentIds.Where(x => !common.Contains(x)).ToList();
+
+                                // Update updated, new and deleted linked documents
+                                _commands.Add(new UpdateIndexCommand(index, addedDocumentIds, deletedDocumentIds, Store, collection));
+                            }
                         }
                         else
                         {
-                            index.Id = dbIndex.Id;
-
-                            var common = addedDocumentIds.Intersect(deletedDocumentIds).ToArray();
-                            addedDocumentIds = addedDocumentIds.Where(x => !common.Contains(x)).ToArray();
-                            deletedDocumentIds = deletedDocumentIds.Where(x => !common.Contains(x)).ToArray();
-
-                            // Update updated, new and deleted linked documents
-                            _commands.Add(new UpdateIndexCommand(index, addedDocumentIds, deletedDocumentIds, _tablePrefix));
-                        }
-                    }
-                    else
-                    {
-                        if (index != null)
-                        {
-                            // The index is new
-                            _commands.Add(new CreateIndexCommand(index, addedDocumentIds, _tablePrefix));
+                            if (index != null)
+                            {
+                                // The index is new
+                                _commands.Add(new CreateIndexCommand(index, addedDocumentIds, Store, collection));
+                            }
                         }
                     }
                 }
             }
         }
 
-        private async Task<ReduceIndex> ReduceForAsync(IndexDescriptor descriptor, object currentKey)
+        private async Task<ReduceIndex> ReduceForAsync(IndexDescriptor descriptor, object currentKey, string collection, CancellationToken cancellationToken)
         {
-            await DemandAsync();
+            await CreateConnectionAsync(cancellationToken);
 
-            var name = _tablePrefix + descriptor.IndexType.Name;
-            var sql = "select * from " + _dialect.QuoteForTableName(name) + " where " + _dialect.QuoteForColumnName(descriptor.GroupKey.Name) + " = @currentKey";
+            var name = _tablePrefix + _store.Configuration.TableNameConvention.GetIndexTable(descriptor.IndexType, collection);
+            var sql = "select * from " + _dialect.QuoteForTableName(name, _store.Configuration.Schema) + " where " + _dialect.QuoteForColumnName(descriptor.GroupKey.Name) + " = @currentKey";
 
-            var index = await _connection.QueryAsync(descriptor.IndexType, sql, new { currentKey }, _transaction);
+            var index = await _connection.QueryAsync(descriptor.IndexType, new CommandDefinition(sql, new { currentKey }, _transaction, null, null, CommandFlags.Buffered, cancellationToken));
             return index.FirstOrDefault() as ReduceIndex;
         }
 
@@ -702,9 +1287,9 @@ namespace YesSql
         /// Creates a Func{IIndex, object}; dynamically, based on GroupKey attributes
         /// this function will be used as the keySelector for Linq.Grouping
         /// </summary>
-        private Func<IIndex, object> GetGroupingMetod(IndexDescriptor descriptor)
+        private Func<IIndex, object> GetGroupingMethod(IndexDescriptor descriptor)
         {
-            return _store.GroupMethods.GetOrAdd(descriptor.Type, (Type key) =>
+            return _store.GroupMethods.GetOrAdd(descriptor.Type, type =>
             {
                 // IIndex i => i
                 var instance = Expression.Parameter(typeof(IIndex), "i");
@@ -722,17 +1307,21 @@ namespace YesSql
         /// <summary>
         /// Resolves all the descriptors registered on the Store and the Session
         /// </summary>
-        private IEnumerable<IndexDescriptor> GetDescriptors(Type t)
+        private IEnumerable<IndexDescriptor> GetDescriptors(Type t, string collection)
         {
-            var cacheKey = t.FullName + ":" + CollectionHelper.Current.GetSafeName();
+            _descriptors ??= new Dictionary<string, IEnumerable<IndexDescriptor>>();
+
+            var cacheKey = string.IsNullOrEmpty(collection)
+                ? t.FullName
+                : string.Concat(t.FullName + ":" + collection)
+                ;
 
             if (!_descriptors.TryGetValue(cacheKey, out var typedDescriptors))
             {
-                typedDescriptors = _store.Describe(t);
+                typedDescriptors = _store.Describe(t, collection);
 
                 if (_indexes != null)
                 {
-                    var collection = CollectionHelper.Current.GetSafeName();
                     typedDescriptors = typedDescriptors.Union(_store.CreateDescriptors(t, collection, _indexes)).ToArray();
                 }
 
@@ -742,13 +1331,21 @@ namespace YesSql
             return typedDescriptors;
         }
 
-        private async Task MapNew(Document document, object obj)
+        private async Task MapNew(Document document, object obj, string collection, CancellationToken cancellationToken)
         {
-            var descriptors = GetDescriptors(obj.GetType());
+            var descriptors = GetDescriptors(obj.GetType(), collection);
+
+            var state = GetState(collection);
 
             foreach (var descriptor in descriptors)
             {
-                var mapped = await descriptor.Map(obj);
+                // Ignore index if the object is filtered out
+                if (descriptor.Filter != null && !descriptor.Filter.Invoke(obj))
+                {
+                    continue;
+                }
+
+                var mapped = await descriptor.Map(obj, cancellationToken);
 
                 if (mapped != null)
                 {
@@ -759,6 +1356,8 @@ namespace YesSql
                             continue;
                         }
 
+                        _commands ??= new List<IIndexCommand>();
+
                         index.AddDocument(document);
 
                         // if the mapped elements are not meant to be reduced,
@@ -767,22 +1366,22 @@ namespace YesSql
                         {
                             if (index.Id == 0)
                             {
-                                _commands.Add(new CreateIndexCommand(index, Enumerable.Empty<int>(), _tablePrefix));
+                                _commands.Add(new CreateIndexCommand(index, Enumerable.Empty<long>(), Store, collection));
                             }
                             else
                             {
-                                _commands.Add(new UpdateIndexCommand(index, Enumerable.Empty<int>(), Enumerable.Empty<int>(), _tablePrefix));
+                                _commands.Add(new UpdateIndexCommand(index, Enumerable.Empty<long>(), Enumerable.Empty<long>(), Store, collection));
                             }
                         }
                         else
                         {
                             // save for later reducing
-                            if (!_maps.TryGetValue(descriptor, out var listmap))
+                            if (!state.Maps.TryGetValue(descriptor, out var mapStates))
                             {
-                                _maps.Add(descriptor, listmap = new List<MapState>());
+                                state.Maps.Add(descriptor, mapStates = new List<MapState>());
                             }
 
-                            listmap.Add(new MapState(index, MapStates.New));
+                            mapStates.Add(new MapState(index, MapStates.New));
                         }
                     }
                 }
@@ -792,32 +1391,42 @@ namespace YesSql
         /// <summary>
         /// Update map and reduce indexes when an entity is deleted.
         /// </summary>
-        private async Task MapDeleted(Document document, object obj)
+        private async Task MapDeleted(Document document, object obj, string collection, CancellationToken cancellationToken)
         {
-            var descriptors = GetDescriptors(obj.GetType());
+            var descriptors = GetDescriptors(obj.GetType(), collection);
+
+            var state = GetState(collection);
 
             foreach (var descriptor in descriptors)
             {
+                // Ignore index if the object is filtered out
+                if (descriptor.Filter != null && !descriptor.Filter.Invoke(obj))
+                {
+                    continue;
+                }
+
+                _commands ??= new List<IIndexCommand>();
+
                 // If the mapped elements are not meant to be reduced, delete
                 if (descriptor.Reduce == null || descriptor.Delete == null)
                 {
-                    _commands.Add(new DeleteMapIndexCommand(descriptor.IndexType, document.Id, _tablePrefix, _dialect));
+                    _commands.Add(new DeleteMapIndexCommand(descriptor.IndexType, document.Id, Store, collection));
                 }
                 else
                 {
-                    var mapped = await descriptor.Map(obj);
+                    var mapped = await descriptor.Map(obj, cancellationToken);
 
                     if (mapped != null)
                     {
                         foreach (var index in mapped)
                         {
                             // save for later reducing
-                            if (!_maps.TryGetValue(descriptor, out var listmap))
+                            if (!state.Maps.TryGetValue(descriptor, out var mapStates))
                             {
-                                _maps.Add(descriptor, listmap = new List<MapState>());
+                                state.Maps.Add(descriptor, mapStates = new List<MapState>());
                             }
 
-                            listmap.Add(new MapState(index, MapStates.Delete));
+                            mapStates.Add(new MapState(index, MapStates.Delete));
                             index.RemoveDocument(document);
                         }
                     }
@@ -826,61 +1435,78 @@ namespace YesSql
         }
 
         /// <summary>
-        /// Initializes a new transaction if none has been yet
+        /// Initializes a new connection if none has been yet. Use this method when reads need to be done.
         /// </summary>
-        public async Task<IDbTransaction> DemandAsync()
+        public async Task<DbConnection> CreateConnectionAsync(CancellationToken cancellationToken = default)
+        {
+            CheckDisposed();
+
+            _connection ??= _store.Configuration.ConnectionFactory.CreateConnection();
+
+            if (_connection.State == ConnectionState.Closed)
+            {
+                await _connection.OpenAsync(cancellationToken);
+            }
+
+            return _connection;
+        }
+
+        public Task<DbConnection> CreateConnectionAsync()
+            => CreateConnectionAsync(CancellationToken.None);
+
+        public DbTransaction CurrentTransaction => _transaction;
+
+        public Task<DbTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default)
+            => BeginTransactionAsync(Store.Configuration.IsolationLevel, cancellationToken);
+
+        public Task<DbTransaction> BeginTransactionAsync()
+            => BeginTransactionAsync(CancellationToken.None);
+
+        /// <summary>
+        /// Begins a new transaction if none has been yet. Use this method when writes need to be done.
+        /// </summary>
+        public async Task<DbTransaction> BeginTransactionAsync(IsolationLevel isolationLevel, CancellationToken cancellationToken = default)
         {
             CheckDisposed();
 
             if (_transaction == null)
             {
-                if (_connection == null)
-                {
-                    _connection = _store.Configuration.ConnectionFactory.CreateConnection() as DbConnection;
+                await CreateConnectionAsync(cancellationToken);
 
-                    if (_connection == null)
-                    {
-                        throw new InvalidOperationException("The connection couldn't be covnerted to DbConnection");
-                    }
-
-                    // The dialect could already be initialized if the session is reused
-                    if (_dialect == null)
-                    {
-                        _dialect = Store.Dialect;
-                    }
-                }
-
-                if (_connection.State == ConnectionState.Closed)
-                {
-                    await _connection.OpenAsync();
-                }
-
-                // In the case of shared connections (InMemory) this can throw as the transation
+                // In the case of shared connections (InMemory) this can throw as the transaction
                 // might already be set by a concurrent thread on the same shared connection.
-                _transaction = _connection.BeginTransaction(_isolationLevel);
+                _transaction = await _connection.BeginTransactionAsync(isolationLevel, cancellationToken);
             }
 
             return _transaction;
         }
 
-        public void Cancel()
+        public Task<DbTransaction> BeginTransactionAsync(IsolationLevel isolationLevel)
+            => BeginTransactionAsync(isolationLevel, CancellationToken.None);
+
+        public Task CancelAsync()
+        {
+            EnterAsyncExecution();
+
+            try
+            {
+                return CancelAsyncInternal();
+            }
+            finally
+            {
+                ExitAsyncExecution();
+            }
+        }
+
+        internal Task CancelAsyncInternal()
         {
             CheckDisposed();
 
             _cancel = true;
+
+            return ReleaseTransactionAsync();
         }
 
         public IStore Store => _store;
-
-        #region Storage implementation
-        
-        private struct IdString
-        {
-#pragma warning disable 0649
-            public int Id;
-            public string Content;
-#pragma warning restore 0649
-        }
-        #endregion
     }
 }

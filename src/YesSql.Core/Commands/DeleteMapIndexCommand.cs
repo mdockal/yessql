@@ -1,29 +1,50 @@
-﻿using Dapper;
+using Dapper;
+using Microsoft.Extensions.Logging;
 using System;
-using System.Data;
+using System.Collections.Generic;
+using System.Data.Common;
+using System.Threading;
 using System.Threading.Tasks;
-using YesSql.Sql;
 
 namespace YesSql.Commands
 {
-    public class DeleteMapIndexCommand : IIndexCommand
+    public sealed class DeleteMapIndexCommand : IIndexCommand, ICollectionName
     {
-        private readonly int _documentId;
-        private readonly Type _indexType;
-        private readonly string _tablePrefix;
-
+        private readonly IStore _store;
+        public long DocumentId { get; }
+        public Type IndexType { get; }
+        public string Collection { get; }
         public int ExecutionOrder { get; } = 1;
 
-        public DeleteMapIndexCommand(Type indexType, int documentId, string tablePrefix, ISqlDialect dialect)
+        public DeleteMapIndexCommand(Type indexType, long documentId, IStore store, string collection)
         {
-            _indexType = indexType;
-            _documentId = documentId;
-            _tablePrefix = tablePrefix;
+            IndexType = indexType;
+            DocumentId = documentId;
+            Collection = collection;
+            _store = store;
         }
 
-        public virtual Task ExecuteAsync(IDbConnection connection, IDbTransaction transaction, ISqlDialect dialect)
+        public Task ExecuteAsync(DbConnection connection, DbTransaction transaction, ISqlDialect dialect, ILogger logger, CancellationToken cancellationToken = default)
         {
-            return connection.ExecuteAsync("delete from " + dialect.QuoteForTableName(_tablePrefix + _indexType.Name) + " where " + dialect.QuoteForColumnName("DocumentId") + " = @Id", new { Id = _documentId }, transaction);
+            var command = $"delete from {dialect.QuoteForTableName(_store.Configuration.TablePrefix + _store.Configuration.TableNameConvention.GetIndexTable(IndexType, Collection), _store.Configuration.Schema)} where {dialect.QuoteForColumnName("DocumentId")} = @Id;";
+            
+            if (logger.IsEnabled(LogLevel.Trace))
+            {
+                logger.LogTrace(command);
+            }
+
+            return connection.ExecuteAsync(new CommandDefinition(command, new { Id = DocumentId }, transaction, null, null, CommandFlags.Buffered, cancellationToken));
+        }
+
+        public bool AddToBatch(ISqlDialect dialect, List<string> queries, DbCommand command, List<Action<DbDataReader>> actions, int index)
+        {
+            var sql = $"delete from {dialect.QuoteForTableName(_store.Configuration.TablePrefix + _store.Configuration.TableNameConvention.GetIndexTable(IndexType, Collection), _store.Configuration.Schema)} where {dialect.QuoteForColumnName("DocumentId")} = @Id_{index};";
+
+            queries.Add(sql);
+
+            command.AddParameter($"Id_{index}", DocumentId);
+
+            return true;
         }
     }
 }

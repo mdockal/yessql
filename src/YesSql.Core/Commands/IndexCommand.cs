@@ -1,37 +1,46 @@
-﻿using System;
+using Microsoft.Extensions.Logging;
+using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Data;
+using System.Data.Common;
 using System.Linq;
 using System.Reflection;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using YesSql.Indexes;
-using YesSql.Sql;
+using YesSql.Serialization;
 
 namespace YesSql.Commands
 {
     public abstract class IndexCommand : IIndexCommand
     {
-        protected readonly string _tablePrefix;
+        protected const string ParameterSuffix = "_$$$";
 
-        private static readonly ConcurrentDictionary<string, PropertyInfo[]> TypeProperties = new ConcurrentDictionary<string, PropertyInfo[]>();
-        private static readonly ConcurrentDictionary<string, string> InsertsList = new ConcurrentDictionary<string, string>();
-        private static readonly ConcurrentDictionary<string, string> UpdatesList = new ConcurrentDictionary<string, string>();
+        protected readonly IStore _store;
 
-        protected static PropertyInfo[] KeysProperties = new[] { typeof(IIndex).GetProperty("Id") };
+        private static readonly ConcurrentDictionary<PropertyInfo, PropertyInfoAccessor> PropertyAccessors = new();
+        private static readonly ConcurrentDictionary<string, PropertyInfo[]> TypeProperties = new();
+        private static readonly ConcurrentDictionary<CompoundKey, string> InsertsList = new();
+        private static readonly ConcurrentDictionary<CompoundKey, string> UpdatesList = new();
+
+        protected static readonly PropertyInfo[] KeysProperties = new[] { typeof(IIndex).GetProperty("Id") };
 
         public abstract int ExecutionOrder { get; }
 
-        public IndexCommand(IIndex index, string tablePrefix)
+        protected IndexCommand(IIndex index, IStore store, string collection)
         {
             Index = index;
-            _tablePrefix = tablePrefix;
+            _store = store;
+            Collection = collection;
         }
 
         public IIndex Index { get; }
         public Document Document { get; }
+        public string Collection { get; }
 
-        public abstract Task ExecuteAsync(IDbConnection connection, IDbTransaction transaction, ISqlDialect dialect);
+        public abstract Task ExecuteAsync(DbConnection connection, DbTransaction transaction, ISqlDialect dialect, ILogger logger, CancellationToken cancellationToken = default);
 
         public static void ResetQueryCache()
         {
@@ -39,9 +48,27 @@ namespace YesSql.Commands
             UpdatesList.Clear();
         }
 
+        protected static void GetProperties(DbCommand command, object item, string suffix, ISqlDialect dialect)
+        {
+            var type = item.GetType();
+
+            foreach (var property in TypePropertiesCache(type))
+            {
+                var accessor = PropertyAccessors.GetOrAdd(property, p => new PropertyInfoAccessor(p));
+
+                var value = accessor.Get(item);
+
+                var parameter = command.CreateParameter();
+                parameter.ParameterName = property.Name + suffix;
+                parameter.Value = dialect.TryConvert(value) ?? DBNull.Value;
+                parameter.DbType = dialect.ToDbType(property.PropertyType);
+                command.Parameters.Add(parameter);
+            }
+        }
+
         protected static PropertyInfo[] TypePropertiesCache(Type type)
         {
-            if (TypeProperties.TryGetValue(type.FullName, out PropertyInfo[] pis))
+            if (TypeProperties.TryGetValue(type.FullName, out var pis))
             {
                 return pis;
             }
@@ -53,45 +80,85 @@ namespace YesSql.Commands
 
         protected string Inserts(Type type, ISqlDialect dialect)
         {
-            if (!InsertsList.TryGetValue(dialect.Name + type.FullName, out string result))
+            var key = new CompoundKey(
+                dialect.Name,
+                type.FullName,
+                _store.Configuration.Schema,
+                _store.Configuration.TablePrefix,
+                Collection);
+
+            if (!InsertsList.TryGetValue(key, out var result))
             {
-                string values = dialect.DefaultValuesInsert;
+                string values;
 
                 var allProperties = TypePropertiesCache(type);
 
-                if (allProperties.Any())
+                if (allProperties.Length > 0)
                 {
                     var sbColumnList = new StringBuilder(null);
 
-                    for (var i = 0; i < allProperties.Count(); i++)
+                    for (var i = 0; i < allProperties.Length; i++)
                     {
                         var property = allProperties.ElementAt(i);
                         sbColumnList.Append(dialect.QuoteForColumnName(property.Name));
-                        if (i < allProperties.Count() - 1)
+                        if (i < allProperties.Length - 1)
+                        {
                             sbColumnList.Append(", ");
+                        }
                     }
 
                     var sbParameterList = new StringBuilder(null);
-                    for (var i = 0; i < allProperties.Count(); i++)
+                    for (var i = 0; i < allProperties.Length; i++)
                     {
                         var property = allProperties.ElementAt(i);
-                        sbParameterList.Append("@" + property.Name);
-                        if (i < allProperties.Count() - 1)
+
+                        sbParameterList.Append('@')
+                            .Append(property.Name)
+                            .Append(ParameterSuffix);
+
+                        if (i < allProperties.Length - 1)
+                        {
                             sbParameterList.Append(", ");
+                        }
                     }
 
-                    values = " (" + sbColumnList + ") VALUES (" + sbParameterList + ")";
+                    if (typeof(MapIndex).IsAssignableFrom(type))
+                    {
+                        // We can set the document id 
+                        sbColumnList.Append(", ").Append(dialect.QuoteForColumnName("DocumentId"));
+                        sbParameterList.Append(", @DocumentId").Append(ParameterSuffix);
+                    }
+
+                    values = $"({sbColumnList}) values ({sbParameterList})";
+                }
+                else
+                {
+                    if (typeof(MapIndex).IsAssignableFrom(type))
+                    {
+                        values = $"({dialect.QuoteForColumnName("DocumentId")}) values (@DocumentId{ParameterSuffix})";
+                    }
+                    else
+                    {
+                        values = dialect.DefaultValuesInsert;
+                    }
                 }
 
-                InsertsList[type.FullName] = result = "INSERT INTO " + dialect.QuoteForTableName(_tablePrefix + type.Name) + " " + values;
+                InsertsList[key] = result = $"insert into {dialect.QuoteForTableName(_store.Configuration.TablePrefix + _store.Configuration.TableNameConvention.GetIndexTable(type, Collection), _store.Configuration.Schema)} {values} {dialect.IdentitySelectString} {dialect.QuoteForColumnName("Id")};";
             }
 
-            return String.Format(result, _tablePrefix);
+            return result;
         }
 
         protected string Updates(Type type, ISqlDialect dialect)
         {
-            if (!UpdatesList.TryGetValue(dialect.Name + type.FullName, out string result))
+            var key = new CompoundKey(
+                dialect.Name,
+                type.FullName,
+                _store.Configuration.Schema,
+                _store.Configuration.TablePrefix,
+                Collection);
+
+            if (!UpdatesList.TryGetValue(key, out var result))
             {
                 var allProperties = TypePropertiesCache(type);
                 var values = new StringBuilder(null);
@@ -99,15 +166,17 @@ namespace YesSql.Commands
                 for (var i = 0; i < allProperties.Length; i++)
                 {
                     var property = allProperties[i];
-                    values.Append(dialect.QuoteForColumnName(property.Name) + " = @" + property.Name);
+                    values.Append(dialect.QuoteForColumnName(property.Name) + " = @" + property.Name + ParameterSuffix);
                     if (i < allProperties.Length - 1)
+                    {
                         values.Append(", ");
+                    }
                 }
 
-                UpdatesList[type.FullName] = result = "UPDATE " + dialect.QuoteForTableName(_tablePrefix + type.Name) + " SET " + values + " WHERE " + dialect.QuoteForColumnName("Id") + " = @Id;";
+                UpdatesList[key] = result = $"update {dialect.QuoteForTableName(_store.Configuration.TablePrefix + _store.Configuration.TableNameConvention.GetIndexTable(type, Collection), _store.Configuration.Schema)} set {values} where {dialect.QuoteForColumnName("Id")} = @Id{ParameterSuffix};";
             }
 
-            return String.Format(result, _tablePrefix);
+            return result;
         }
 
         private static bool IsWriteable(PropertyInfo pi)
@@ -119,5 +188,9 @@ namespace YesSql.Commands
                 pi.Name != "DocumentId"
                 ;
         }
+
+        public abstract bool AddToBatch(ISqlDialect dialect, List<string> queries, DbCommand batchCommand, List<Action<DbDataReader>> actions, int index);
+
+        private sealed record CompoundKey(string Dialect, string Type, string Schema, string Prefix, string Collection);
     }
 }

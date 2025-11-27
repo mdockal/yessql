@@ -1,7 +1,4 @@
-using System;
-using System.Collections.Generic;
 using System.Linq;
-using System.Text;
 using YesSql.Indexes;
 using YesSql.Tests.Models;
 
@@ -31,7 +28,7 @@ namespace YesSql.Tests.Indexes
                     .Map(email => new AttachmentByDay
                     {
                         Date = email.Date.DayOfYear,
-                        Count = email.Attachements.Count()
+                        Count = email.Attachments.Count
                     })
                     .Group(email => email.Date)
                     .Reduce(group => new AttachmentByDay

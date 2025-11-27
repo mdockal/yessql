@@ -18,6 +18,13 @@ namespace YesSql.Tests.CompiledQueries
 
         public Expression<Func<IQuery<Person>, IQuery<Person>>> Query()
         {
+            // Because each compiled query has difference caches for each combination of nullable properties,
+            // it's possible to return different queries when the nullability of a property changes.
+            // for instance:
+            // return Name == null
+            // ? query.With<PersonByAge>(x => x.Age == Age)
+            // : query.With<PersonByAge>(x => x.Age == Age && x.Name == Name);
+
             return query => query.With<PersonByAge>(x => x.Age == Age || x.Name == Name);
         }
     }
@@ -35,6 +42,14 @@ namespace YesSql.Tests.CompiledQueries
         public Expression<Func<IQuery<Person>, IQuery<Person>>> Query()
         {
             return query => query.With<PersonByAge>().OrderByDescending(x => x.Age);
+        }
+    }
+
+    public class PersonPagedQuery : ICompiledQuery<Person>
+    {
+        public Expression<Func<IQuery<Person>, IQuery<Person>>> Query()
+        {
+            return query => query.With<PersonByAge>().Take(1);
         }
     }
 }

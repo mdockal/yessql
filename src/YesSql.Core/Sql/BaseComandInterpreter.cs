@@ -10,11 +10,13 @@ namespace YesSql.Sql
     public abstract class BaseCommandInterpreter : ICommandInterpreter
     {
         protected readonly ISqlDialect _dialect;
+        protected readonly IConfiguration _configuration;
         private const char Space = ' ';
 
-        public BaseCommandInterpreter(ISqlDialect dialect)
+        protected BaseCommandInterpreter(IConfiguration configuration)
         {
-            _dialect = dialect;
+            _dialect = configuration.SqlDialect;
+            _configuration = configuration;
         }
 
         public IEnumerable<string> CreateSql(IEnumerable<ISchemaCommand> commands)
@@ -50,6 +52,9 @@ namespace YesSql.Sql
                     case SchemaCommandType.DropForeignKey:
                         sqlCommands.AddRange(Run((IDropForeignKeyCommand)schemaCommand));
                         break;
+                    case SchemaCommandType.CreateSchema:
+                        sqlCommands.AddRange(Run((ICreateSchemaCommand)schemaCommand));
+                        break;
                 }
             }
 
@@ -64,7 +69,7 @@ namespace YesSql.Sql
 
             builder.Append(_dialect.CreateTableString)
                 .Append(' ')
-                .Append(_dialect.QuoteForTableName(command.Name))
+                .Append(_dialect.QuoteForTableName(command.Name, _configuration.Schema))
                 .Append(" (");
 
             var appendComma = false;
@@ -79,8 +84,10 @@ namespace YesSql.Sql
                 Run(builder, createColumn);
             }
 
+            // We only create PK statements on columns that don't have IsIdentity since IsIdentity statements also contains the notion of primary key.
+
             var primaryKeys = command.TableCommands.OfType<CreateColumnCommand>().Where(ccc => ccc.IsPrimaryKey && !ccc.IsIdentity).Select(ccc => _dialect.QuoteForColumnName(ccc.ColumnName)).ToArray();
-            if (primaryKeys.Any())
+            if (primaryKeys.Length > 0)
             {
                 if (appendComma)
                 {
@@ -89,7 +96,7 @@ namespace YesSql.Sql
 
                 builder.Append(_dialect.PrimaryKeyString)
                     .Append(" ( ")
-                    .Append(String.Join(", ", primaryKeys.ToArray()))
+                    .Append(string.Join(", ", primaryKeys.ToArray()))
                     .Append(" )");
             }
 
@@ -99,10 +106,12 @@ namespace YesSql.Sql
 
         public virtual IEnumerable<string> Run(IDropTableCommand command)
         {
-            var builder = new StringBuilder();
+            yield return _dialect.GetDropTableString(command.Name, _configuration.Schema);
+        }
 
-            builder.Append(_dialect.GetDropTableString(command.Name));
-            yield return builder.ToString();
+        public virtual IEnumerable<string> Run(ICreateSchemaCommand command)
+        {
+            yield return _dialect.GetCreateSchemaString(command.Name);
         }
 
         public virtual IEnumerable<string> Run(IAlterTableCommand command)
@@ -112,13 +121,12 @@ namespace YesSql.Sql
                 yield break;
             }
 
-            var commands = new List<string>();
-
             // drop columns
             foreach (var dropColumn in command.TableCommands.OfType<DropColumnCommand>())
             {
                 var builder = new StringBuilder();
                 Run(builder, dropColumn);
+                yield return builder.ToString();
             }
 
             // add columns
@@ -134,6 +142,14 @@ namespace YesSql.Sql
             {
                 var builder = new StringBuilder();
                 Run(builder, alterColumn);
+                yield return builder.ToString();
+            }
+
+            // rename columns
+            foreach (var renameColumn in command.TableCommands.OfType<RenameColumnCommand>())
+            {
+                var builder = new StringBuilder();
+                Run(builder, renameColumn);
                 yield return builder.ToString();
             }
 
@@ -156,27 +172,33 @@ namespace YesSql.Sql
 
         public virtual void Run(StringBuilder builder, IAddColumnCommand command)
         {
-            builder.AppendFormat("alter table {0} add ", _dialect.QuoteForTableName(command.Name));
+            builder.AppendFormat("alter table {0} add ",
+                _dialect.QuoteForTableName(command.Name, _configuration.Schema)
+                );
             Run(builder, (CreateColumnCommand)command);
         }
 
         public virtual void Run(StringBuilder builder, IDropColumnCommand command)
         {
             builder.AppendFormat("alter table {0} drop column {1}",
-                _dialect.QuoteForTableName(command.Name),
-                _dialect.QuoteForColumnName(command.ColumnName));
+                _dialect.QuoteForTableName(command.Name, _configuration.Schema),
+                _dialect.QuoteForColumnName(command.ColumnName)
+                );
         }
 
         public virtual void Run(StringBuilder builder, IAlterColumnCommand command)
         {
             builder.AppendFormat("alter table {0} alter column {1} ",
-                _dialect.QuoteForTableName(command.Name),
-                _dialect.QuoteForColumnName(command.ColumnName));
+                _dialect.QuoteForTableName(command.Name, _configuration.Schema),
+                _dialect.QuoteForColumnName(command.ColumnName)
+                );
+
+            var dbType = _dialect.ToDbType(command.DbType);
 
             // type
-            if (command.DbType != DbType.Object)
+            if (dbType != DbType.Object)
             {
-                builder.Append(_dialect.GetTypeName(command.DbType, command.Length, command.Precision, command.Scale));
+                builder.Append(_dialect.GetTypeName(dbType, command.Length, command.Precision, command.Scale));
             }
             else
             {
@@ -193,19 +215,27 @@ namespace YesSql.Sql
             }
         }
 
+        public virtual void Run(StringBuilder builder, IRenameColumnCommand command)
+        {
+            builder.AppendFormat("alter table {0} rename column {1} to {2}",
+                _dialect.QuoteForTableName(command.Name, _configuration.Schema),
+                _dialect.QuoteForColumnName(command.ColumnName),
+                _dialect.QuoteForColumnName(command.NewColumnName)
+                );
+        }
+
         public virtual void Run(StringBuilder builder, IAddIndexCommand command)
         {
             builder.AppendFormat("create index {1} on {0} ({2}) ",
-                _dialect.QuoteForTableName(command.Name),
+                _dialect.QuoteForTableName(command.Name, _configuration.Schema),
                 _dialect.QuoteForColumnName(command.IndexName),
-                String.Join(", ", command.ColumnNames.Select(x => _dialect.QuoteForColumnName(x)).ToArray()));
+                string.Join(", ", command.ColumnNames.Select(x => _dialect.QuoteForColumnName(GetRawColumnName(x))).ToArray())
+                );
         }
 
         public virtual void Run(StringBuilder builder, IDropIndexCommand command)
         {
-            builder.AppendFormat("drop index {0} ON {1}",
-                _dialect.QuoteForColumnName(command.IndexName),
-                _dialect.QuoteForTableName(command.Name));
+            builder.Append(_dialect.GetDropIndexString(command.IndexName, command.Name, _configuration.Schema));
         }
 
         public virtual IEnumerable<string> Run(ISqlStatementCommand command)
@@ -223,11 +253,11 @@ namespace YesSql.Sql
             var builder = new StringBuilder();
 
             builder.Append("alter table ")
-                .Append(_dialect.QuoteForTableName(command.SrcTable));
+                .Append(_dialect.QuoteForTableName(command.SrcTable, _configuration.Schema));
 
             builder.Append(_dialect.GetAddForeignKeyConstraintString(command.Name,
                 command.SrcColumns.Select(x => _dialect.QuoteForColumnName(x)).ToArray(),
-                _dialect.QuoteForTableName(command.DestTable),
+                _dialect.QuoteForTableName(command.DestTable, _configuration.Schema),
                 command.DestColumns.Select(x => _dialect.QuoteForColumnName(x)).ToArray(),
                 false));
 
@@ -239,7 +269,7 @@ namespace YesSql.Sql
             var builder = new StringBuilder();
 
             builder.Append("alter table ")
-                .Append(_dialect.QuoteForTableName(command.SrcTable))
+                .Append(_dialect.QuoteForTableName(command.SrcTable, _configuration.Schema))
                 .Append(_dialect.GetDropForeignKeyConstraintString(command.Name));
             yield return builder.ToString();
         }
@@ -251,13 +281,15 @@ namespace YesSql.Sql
 
             if (!command.IsIdentity || _dialect.HasDataTypeInIdentityColumn)
             {
-                builder.Append(_dialect.GetTypeName(command.DbType, command.Length, command.Precision, command.Scale));
+                var dbType = _dialect.ToDbType(command.DbType);
+
+                builder.Append(_dialect.GetTypeName(dbType, command.Length, command.Precision, command.Scale));
             }
 
             // append identity if handled
             if (command.IsIdentity && _dialect.SupportsIdentityColumns)
             {
-                builder.Append(Space).Append(_dialect.IdentityColumnString);
+                builder.Append(Space).Append(_configuration.IdentityColumnSize == IdentityColumnSize.Int32 ? _dialect.LegacyIdentityColumnString : _dialect.IdentityColumnString);
             }
 
             // [default value]
@@ -273,11 +305,30 @@ namespace YesSql.Sql
                                      ? _dialect.NullColumnString
                                      : string.Empty);
 
-            // append unique if handled, otherwise at the end of the satement
+            // append unique if handled, otherwise at the end of the statement
             if (command.IsUnique && _dialect.SupportsUnique)
             {
                 builder.Append(" unique");
             }
+        }
+
+        /// <summary>
+        /// When the given column name contains length (ex, Alias(50)), we return the actual column name
+        /// which is in this example 'Alias'.
+        /// Some providers like MySQL support specifying length of each column in a combined index.
+        /// </summary>
+        /// <param name="name"></param>
+        /// <returns></returns>
+        private static string GetRawColumnName(string name)
+        {
+            var index = name.IndexOf('(');
+
+            if (index > -1)
+            {
+                return name[..index].Trim();
+            }
+
+            return name;
         }
     }
 }

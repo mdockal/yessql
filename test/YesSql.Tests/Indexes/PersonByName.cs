@@ -6,7 +6,10 @@ namespace YesSql.Tests.Indexes
 {
     public class PersonByName : MapIndex
     {
+        public long DocumentId { get; set; }
+
         public string SomeName { get; set; }
+
         public static string Normalize(string name)
         {
             return name.ToUpperInvariant();
@@ -19,6 +22,17 @@ namespace YesSql.Tests.Indexes
         {
             context
                 .For<PersonByName>()
+                .Map(person => new PersonByName { SomeName = person.Firstname });
+        }
+    }
+
+    public class PersonWithAIndexProvider : IndexProvider<Person>
+    {
+        public override void Describe(DescribeContext<Person> context)
+        {
+            context
+                .For<PersonByName>()
+                .When(p => p.Firstname.StartsWith("A", System.StringComparison.OrdinalIgnoreCase))
                 .Map(person => new PersonByName { SomeName = person.Firstname });
         }
     }
@@ -57,5 +71,4 @@ namespace YesSql.Tests.Indexes
                 });
         }
     }
-
 }

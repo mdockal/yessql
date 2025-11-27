@@ -2,6 +2,12 @@
 	"version": "0.2.0",
 	"configurations": [
 		{
+			"name": ".NET Core Attach",
+			"type": "coreclr",
+			"request": "attach",
+			"processId": "${command:pickProcess}"
+		},
+		{
 			"name": ".NET Core Launch (Samples.Hi)",
 			"type": "coreclr",
 			"request": "launch",
@@ -40,6 +46,16 @@
 			"args": [],
 			"cwd": "${workspaceRoot}/samples/YesSql.Bench",
 			"stopAtEntry": false
-		}
+		},
+		{
+			"name": ".NET Core Launch (Samples.Web)",
+			"type": "coreclr",
+			"request": "launch",
+			"preLaunchTask": "Dotnet Build Web Debug",
+			"program": "${workspaceRoot}/samples/YesSql.Samples.Web/bin/Debug/net5.0/YesSql.Samples.Web.dll",
+			"args": [],
+			"cwd": "${workspaceRoot}/samples/YesSql.Samples.Web",
+			"stopAtEntry": false
+		},
 	]
 }

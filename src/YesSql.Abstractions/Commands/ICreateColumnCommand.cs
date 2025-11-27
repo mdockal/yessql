@@ -1,5 +1,3 @@
-﻿using System.Data;
-
 namespace YesSql.Sql.Schema
 {
     public interface ICreateColumnCommand : IColumnCommand
@@ -16,9 +14,9 @@ namespace YesSql.Sql.Schema
 
         ICreateColumnCommand Identity();
 
-        ICreateColumnCommand WithPrecision(byte precision);
+        ICreateColumnCommand WithPrecision(byte? precision);
 
-        ICreateColumnCommand WithScale(byte scale);
+        ICreateColumnCommand WithScale(byte? scale);
 
         ICreateColumnCommand NotNull();
 

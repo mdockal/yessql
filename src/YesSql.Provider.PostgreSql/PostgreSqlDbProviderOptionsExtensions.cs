@@ -6,37 +6,30 @@ namespace YesSql.Provider.PostgreSql
 {
     public static class PostgreSqlDbProviderOptionsExtensions
     {
-        public static IConfiguration RegisterPostgreSql(this IConfiguration configuration)
-        {
-            SqlDialectFactory.SqlDialects["npgsqlconnection"] = new PostgreSqlDialect();
-            CommandInterpreterFactory.CommandInterpreters["npgsqlconnection"] = d => new PostgreSqlCommandInterpreter(d);
-
-            return configuration;
-        }
-
         public static IConfiguration UsePostgreSql(
             this IConfiguration configuration,
-            string connectionString)
+            string connectionString,
+            string schema = null)
         {
-            return UsePostgreSql(configuration, connectionString, IsolationLevel.ReadUncommitted);
+            return UsePostgreSql(configuration, connectionString, IsolationLevel.ReadUncommitted, schema);
         }
 
         public static IConfiguration UsePostgreSql(
             this IConfiguration configuration,
             string connectionString,
-            IsolationLevel isolationLevel)
+            IsolationLevel isolationLevel,
+            string schema = null)
         {
-            if (configuration == null)
-            {
-                throw new ArgumentNullException(nameof(configuration));
-            }
+            ArgumentNullException.ThrowIfNull(configuration);
 
-            if (String.IsNullOrWhiteSpace(connectionString))
+            if (string.IsNullOrWhiteSpace(connectionString))
             {
                 throw new ArgumentException(nameof(connectionString));
             }
 
-            RegisterPostgreSql(configuration);
+            configuration.SqlDialect = new PostgreSqlDialect();
+            configuration.Schema = schema;
+            configuration.CommandInterpreter = new PostgreSqlCommandInterpreter(configuration);
             configuration.ConnectionFactory = new DbConnectionFactory<NpgsqlConnection>(connectionString);
             configuration.IsolationLevel = isolationLevel;
 

@@ -1,104 +1,103 @@
 using Dapper;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
-using System.Data;
-using YesSql.Collections;
+using System.Data.Common;
+using System.Threading.Tasks;
 using YesSql.Sql.Schema;
 
 namespace YesSql.Sql
 {
-    public class SchemaBuilder
+    public class SchemaBuilder : ISchemaBuilder
     {
-        private ICommandInterpreter _builder;
-        private string _tablePrefix;
-        private ISqlDialect _dialect;
-        public IDbConnection Connection { get; private set; }
-        public IDbTransaction Transaction { get; private set; }
-        public bool ThrowOnError { get; set; } = true;
+        private readonly ICommandInterpreter _commandInterpreter;
+        private readonly ILogger _logger;
 
-        public SchemaBuilder(ISession session)
-        {
-            Transaction = session.DemandAsync().GetAwaiter().GetResult();
-            Connection = Transaction.Connection;
-            _builder = CommandInterpreterFactory.For(Connection);
-            _dialect = session.Store.Dialect;
-            _tablePrefix = session.Store.Configuration.TablePrefix;
-        }
+        public string TablePrefix { get; private set; }
+        public ISqlDialect Dialect { get; private set; }
+        public ITableNameConvention TableNameConvention { get; private set; }
+        public DbConnection Connection { get; private set; }
+        public DbTransaction Transaction { get; private set; }
+        public bool ThrowOnError { get; private set; }
+        public IdentityColumnSize IdentityColumnSize { get; set; }
 
-        public SchemaBuilder(IDbConnection connection, IDbTransaction transaction, string tablePrefix)
+        public SchemaBuilder(IConfiguration configuration, DbTransaction transaction, bool throwOnError = true)
         {
-            _builder = CommandInterpreterFactory.For(connection);
-            _dialect = SqlDialectFactory.For(connection);
-            _tablePrefix = tablePrefix;
-            Connection = connection;
             Transaction = transaction;
+            _logger = configuration.Logger;
+            Connection = Transaction.Connection;
+            _commandInterpreter = configuration.CommandInterpreter;
+            Dialect = configuration.SqlDialect;
+            TablePrefix = configuration.TablePrefix;
+            ThrowOnError = throwOnError;
+            TableNameConvention = configuration.TableNameConvention;
+            IdentityColumnSize = configuration.IdentityColumnSize;
         }
 
-        private void Execute(IEnumerable<string> statements)
-        {
-            foreach (var statement in statements)
-            {
-                Connection.Execute(statement, null, Transaction);
-            }
-        }
-
-        private string Prefix(string table)
-        {
-            return _tablePrefix + table;
-        }
-
-        public SchemaBuilder CreateMapIndexTable(string name, Action<CreateTableCommand> table)
+        public async Task CreateMapIndexTableAsync(Type indexType, Action<ICreateTableCommand> table, string collection)
         {
             try
             {
-                var createTable = new CreateTableCommand(Prefix(name));
-                var collection = CollectionHelper.Current;
-                var documentTable = collection.GetPrefixedName(Store.DocumentTable);
+                var indexName = indexType.Name;
+                var indexTable = TableNameConvention.GetIndexTable(indexType, collection);
+                var createTable = new CreateTableCommand(Prefix(indexTable));
+                var documentTable = TableNameConvention.GetDocumentTable(collection);
+
+                // NB: Identity() implies PrimaryKey()
 
                 createTable
-                    .Column<int>("Id", column => column.PrimaryKey().Identity().NotNull())
-                    .Column<int>("DocumentId");
-
-                table(createTable);
-                Execute(_builder.CreateSql(createTable));
-
-                CreateForeignKey("FK_" + name, name, new[] { "DocumentId" }, documentTable, new[] { "Id" });
-            }
-            catch
-            {
-                if (ThrowOnError)
-                {
-                    throw;
-                }
-            }
-
-            return this;
-        }
-
-        public SchemaBuilder CreateReduceIndexTable(string name, Action<CreateTableCommand> table)
-        {
-            try
-            {
-                var createTable = new CreateTableCommand(Prefix(name));
-                var collection = CollectionHelper.Current;
-                var documentTable = collection.GetPrefixedName(Store.DocumentTable);
-
-                createTable
-                    .Column<int>("Id", column => column.Identity().NotNull())
+                    .Column(IdentityColumnSize, "Id", column => column.Identity().NotNull())
+                    .Column(IdentityColumnSize, "DocumentId")
                     ;
 
                 table(createTable);
-                Execute(_builder.CreateSql(createTable));
+                await ExecuteAsync(_commandInterpreter.CreateSql(createTable));
 
-                var bridgeTableName = name + "_" + documentTable;
+                await CreateForeignKeyAsync("FK_" + (collection ?? "") + indexName, indexTable, new[] { "DocumentId" }, documentTable, new[] { "Id" });
 
-                CreateTable(bridgeTableName, bridge => bridge
-                    .Column<int>(name + "Id", column => column.NotNull())
-                    .Column<int>("DocumentId", column => column.NotNull())
+                await AlterTableAsync(indexTable, table =>
+                    table.CreateIndex($"IDX_FK_{indexTable}", "DocumentId")
+                    );
+            }
+            catch
+            {
+                if (ThrowOnError)
+                {
+                    throw;
+                }
+            }
+        }
+
+        public async Task CreateReduceIndexTableAsync(Type indexType, Action<ICreateTableCommand> table, string collection = null)
+        {
+            try
+            {
+                var indexName = indexType.Name;
+                var indexTable = TableNameConvention.GetIndexTable(indexType, collection);
+                var createTable = new CreateTableCommand(Prefix(indexTable));
+                var documentTable = TableNameConvention.GetDocumentTable(collection);
+
+                // NB: Identity() implies PrimaryKey()
+
+                createTable.Column(IdentityColumnSize, "Id", column => column.Identity().NotNull())
+                    ;
+
+                table(createTable);
+                await ExecuteAsync(_commandInterpreter.CreateSql(createTable));
+
+                var bridgeTableName = indexTable + "_" + documentTable;
+
+                await CreateTableAsync(bridgeTableName, bridge => bridge
+                    .Column(IdentityColumnSize, indexName + "Id", column => column.NotNull())
+                    .Column(IdentityColumnSize, "DocumentId", column => column.NotNull())
                 );
 
-                CreateForeignKey("FK_" + bridgeTableName + "_Id", bridgeTableName, new[] { name + "Id" }, name, new[] { "Id" });
-                CreateForeignKey("FK_" + bridgeTableName + "_DocumentId", bridgeTableName, new[] { "DocumentId" }, documentTable, new[] { "Id" });
+                await CreateForeignKeyAsync("FK_" + bridgeTableName + "_Id", bridgeTableName, new[] { indexName + "Id" }, indexTable, new[] { "Id" });
+                await CreateForeignKeyAsync("FK_" + bridgeTableName + "_DocumentId", bridgeTableName, new[] { "DocumentId" }, documentTable, new[] { "Id" });
+
+                await AlterTableAsync(bridgeTableName, table =>
+                    table.CreateIndex($"IDX_FK_{bridgeTableName}", indexName + "Id", "DocumentId")
+                    );
             }
             catch
             {
@@ -107,27 +106,25 @@ namespace YesSql.Sql
                     throw;
                 }
             }
-
-            return this;
         }
 
-        public SchemaBuilder DropReduceIndexTable(string name)
+        public async Task DropReduceIndexTableAsync(Type indexType, string collection = null)
         {
             try
             {
-                var collection = CollectionHelper.Current;
-                var documentTable = collection.GetPrefixedName(Store.DocumentTable);
+                var indexTable = TableNameConvention.GetIndexTable(indexType, collection);
+                var documentTable = TableNameConvention.GetDocumentTable(collection);
 
-                var bridgeTableName = name + "_" + documentTable;
+                var bridgeTableName = indexTable + "_" + documentTable;
 
-                if (String.IsNullOrEmpty(_dialect.CascadeConstraintsString))
+                if (string.IsNullOrEmpty(Dialect.CascadeConstraintsString))
                 {
-                    DropForeignKey(bridgeTableName, "FK_" + bridgeTableName + "_Id");
-                    DropForeignKey(bridgeTableName, "FK_" + bridgeTableName + "_DocumentId");
+                    await DropForeignKeyAsync(bridgeTableName, "FK_" + bridgeTableName + "_Id");
+                    await DropForeignKeyAsync(bridgeTableName, "FK_" + bridgeTableName + "_DocumentId");
                 }
 
-                DropTable(bridgeTableName);
-                DropTable(name);
+                await DropTableAsync(bridgeTableName);
+                await DropTableAsync(indexTable);
             }
             catch
             {
@@ -136,20 +133,21 @@ namespace YesSql.Sql
                     throw;
                 }
             }
-
-            return this;
         }
 
-        public SchemaBuilder DropMapIndexTable(string name)
+        public async Task DropMapIndexTableAsync(Type indexType, string collection = null)
         {
             try
             {
-                if (String.IsNullOrEmpty(_dialect.CascadeConstraintsString))
+                var indexName = indexType.Name;
+                var indexTable = TableNameConvention.GetIndexTable(indexType, collection);
+
+                if (string.IsNullOrEmpty(Dialect.CascadeConstraintsString))
                 {
-                    DropForeignKey(name, "FK_" + name);
+                    await DropForeignKeyAsync(indexTable, "FK_" + (collection ?? string.Empty) + indexName);
                 }
 
-                DropTable(name);
+                await DropTableAsync(indexTable);
             }
             catch
             {
@@ -158,17 +156,15 @@ namespace YesSql.Sql
                     throw;
                 }
             }
-
-            return this;
         }
 
-        public SchemaBuilder CreateTable(string name, Action<CreateTableCommand> table)
+        public async Task CreateTableAsync(string name, Action<ICreateTableCommand> table)
         {
             try
             {
                 var createTable = new CreateTableCommand(Prefix(name));
                 table(createTable);
-                Execute(_builder.CreateSql(createTable));
+                await ExecuteAsync(_commandInterpreter.CreateSql(createTable));
             }
             catch
             {
@@ -177,17 +173,15 @@ namespace YesSql.Sql
                     throw;
                 }
             }
-
-            return this;
         }
 
-        public SchemaBuilder AlterTable(string name, Action<AlterTableCommand> table)
+        public async Task AlterTableAsync(string name, Action<IAlterTableCommand> table)
         {
             try
             {
-                var alterTable = new AlterTableCommand(Prefix(name), _dialect, _tablePrefix);
+                var alterTable = new AlterTableCommand(Prefix(name), Dialect, TablePrefix);
                 table(alterTable);
-                Execute(_builder.CreateSql(alterTable));
+                await ExecuteAsync(_commandInterpreter.CreateSql(alterTable));
             }
             catch
             {
@@ -196,16 +190,20 @@ namespace YesSql.Sql
                     throw;
                 }
             }
-
-            return this;
         }
 
-        public SchemaBuilder DropTable(string name)
+        public async Task AlterIndexTableAsync(Type indexType, Action<IAlterTableCommand> table, string collection)
+        {
+            var indexTable = TableNameConvention.GetIndexTable(indexType, collection);
+            await AlterTableAsync(indexTable, table);
+        }
+
+        public async Task DropTableAsync(string name)
         {
             try
             {
                 var deleteTable = new DropTableCommand(Prefix(name));
-                Execute(_builder.CreateSql(deleteTable));
+                await ExecuteAsync(_commandInterpreter.CreateSql(deleteTable));
             }
             catch
             {
@@ -214,16 +212,15 @@ namespace YesSql.Sql
                     throw;
                 }
             }
-
-            return this;
         }
 
-        public SchemaBuilder CreateForeignKey(string name, string srcTable, string[] srcColumns, string destTable, string[] destColumns)
+        public async Task CreateForeignKeyAsync(string name, string srcTable, string[] srcColumns, string destTable, string[] destColumns)
         {
             try
             {
-                var command = new CreateForeignKeyCommand(Prefix(name), Prefix(srcTable), srcColumns, Prefix(destTable), destColumns);
-                Execute(_builder.CreateSql(command));
+                var command = new CreateForeignKeyCommand(Dialect.FormatKeyName(Prefix(name)), Prefix(srcTable), srcColumns, Prefix(destTable), destColumns);
+                var sql = _commandInterpreter.CreateSql(command);
+                await ExecuteAsync(sql);
             }
             catch
             {
@@ -232,16 +229,14 @@ namespace YesSql.Sql
                     throw;
                 }
             }
-
-            return this;
         }
 
-        public SchemaBuilder CreateForeignKey(string name, string srcModule, string srcTable, string[] srcColumns, string destTable, string[] destColumns)
+        public async Task DropForeignKeyAsync(string srcTable, string name)
         {
             try
             {
-                var command = new CreateForeignKeyCommand(Prefix(name), Prefix(srcTable), srcColumns, Prefix(destTable), destColumns);
-                Execute(_builder.CreateSql(command));
+                var command = new DropForeignKeyCommand(Dialect.FormatKeyName(Prefix(srcTable)), Prefix(name));
+                await ExecuteAsync(_commandInterpreter.CreateSql(command));
             }
             catch
             {
@@ -250,16 +245,14 @@ namespace YesSql.Sql
                     throw;
                 }
             }
-            return this;
         }
 
-        public SchemaBuilder CreateForeignKey(string name, string srcTable, string[] srcColumns, string destModule, string destTable, string[] destColumns)
+        public async Task CreateSchemaAsync(string schema)
         {
             try
             {
-                var command = new CreateForeignKeyCommand(Prefix(name), Prefix(srcTable), srcColumns, Prefix(destTable), destColumns);
-                Execute(_builder.CreateSql(command));
-
+                var createSchema = new CreateSchemaCommand(schema);
+                await ExecuteAsync(_commandInterpreter.CreateSql(createSchema));
             }
             catch
             {
@@ -268,44 +261,88 @@ namespace YesSql.Sql
                     throw;
                 }
             }
-
-            return this;
         }
 
-        public SchemaBuilder CreateForeignKey(string name, string srcModule, string srcTable, string[] srcColumns, string destModule, string destTable, string[] destColumns)
+        public ISchemaBuilder AlterTable(string name, Action<IAlterTableCommand> table)
         {
-            try
-            {
-                var command = new CreateForeignKeyCommand(Prefix(name), Prefix(srcTable), srcColumns, Prefix(destTable), destColumns);
-                Execute(_builder.CreateSql(command));
-            }
-            catch
-            {
-                if (ThrowOnError)
-                {
-                    throw;
-                }
-            }
-
+            AlterTableAsync(name, table).GetAwaiter().GetResult();
             return this;
         }
 
-        public SchemaBuilder DropForeignKey(string srcTable, string name)
+        public ISchemaBuilder AlterIndexTable(Type indexType, Action<IAlterTableCommand> table, string collection)
         {
-            try
-            {
-                var command = new DropForeignKeyCommand(Prefix(srcTable), Prefix(name));
-                Execute(_builder.CreateSql(command));
-            }
-            catch
-            {
-                if (ThrowOnError)
-                {
-                    throw;
-                }
-            }
-
+            AlterIndexTableAsync(indexType, table, collection).GetAwaiter().GetResult();
             return this;
         }
+
+        public ISchemaBuilder CreateForeignKey(string name, string srcTable, string[] srcColumns, string destTable, string[] destColumns)
+        {
+            CreateForeignKeyAsync(name, srcTable, srcColumns, destTable, destColumns).GetAwaiter().GetResult();
+            return this;
+        }
+
+        public ISchemaBuilder CreateMapIndexTable(Type indexType, Action<ICreateTableCommand> table, string collection)
+        {
+            CreateMapIndexTableAsync(indexType, table, collection).GetAwaiter().GetResult();
+            return this;
+        }
+
+        public ISchemaBuilder CreateReduceIndexTable(Type indexType, Action<ICreateTableCommand> table, string collection)
+        {
+            CreateReduceIndexTableAsync(indexType, table, collection).GetAwaiter().GetResult();
+            return this;
+        }
+
+        public ISchemaBuilder CreateTable(string name, Action<ICreateTableCommand> table)
+        {
+            CreateTableAsync(name, table).GetAwaiter().GetResult();
+            return this;
+        }
+
+        public ISchemaBuilder DropForeignKey(string srcTable, string name)
+        {
+            DropForeignKeyAsync(srcTable, name).GetAwaiter().GetResult();
+            return this;
+        }
+
+        public ISchemaBuilder DropMapIndexTable(Type indexType, string collection = null)
+        {
+            DropMapIndexTableAsync(indexType, collection).GetAwaiter().GetResult();
+            return this;
+        }
+
+        public ISchemaBuilder DropReduceIndexTable(Type indexType, string collection = null)
+        {
+            DropReduceIndexTableAsync(indexType, collection).GetAwaiter().GetResult();
+            return this;
+        }
+
+        public ISchemaBuilder DropTable(string name)
+        {
+            DropTableAsync(name).GetAwaiter().GetResult();
+            return this;
+        }
+
+        public ISchemaBuilder CreateSchema(string schema)
+        {
+            CreateSchemaAsync(schema).GetAwaiter().GetResult();
+            return this;
+        }
+
+        private async Task ExecuteAsync(IEnumerable<string> statements)
+        {
+            foreach (var statement in statements)
+            {
+                if (string.IsNullOrEmpty(statement))
+                {
+                    continue;
+                }
+
+                _logger.LogTrace(statement);
+                await Connection.ExecuteAsync(statement, null, Transaction);
+            }
+        }
+        private string Prefix(string table)
+            => TablePrefix + table;
     }
 }

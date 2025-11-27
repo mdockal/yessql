@@ -1,43 +1,35 @@
+using MySqlConnector;
 using System;
 using System.Data;
-using MySql.Data.MySqlClient;
 
 namespace YesSql.Provider.MySql
 {
     public static class MySqlDbProviderOptionsExtensions
     {
-        public static IConfiguration RegisterMySql(this IConfiguration configuration)
-        {
-            SqlDialectFactory.SqlDialects["mysqlconnection"] = new MySqlDialect();
-            CommandInterpreterFactory.CommandInterpreters["mysqlconnection"] = d => new MySqlCommandInterpreter(d);
-
-            return configuration;
-        }
-
         public static IConfiguration UseMySql(
             this IConfiguration configuration,
-            string connectionString)
+            string connectionString,
+            string schema = null)
         {
-            return UseMySql(configuration, connectionString, IsolationLevel.ReadUncommitted);
+            return UseMySql(configuration, connectionString, IsolationLevel.ReadUncommitted, schema);
         }
 
         public static IConfiguration UseMySql(
             this IConfiguration configuration,
             string connectionString,
-            IsolationLevel isolationLevel)
+            IsolationLevel isolationLevel,
+            string schema = null)
         {
-            if (configuration == null)
-            {
-                throw new ArgumentNullException(nameof(configuration));
-            }
+            ArgumentNullException.ThrowIfNull(configuration);
 
-            if (String.IsNullOrWhiteSpace(connectionString))
+            if (string.IsNullOrWhiteSpace(connectionString))
             {
                 throw new ArgumentException(nameof(connectionString));
             }
 
-            RegisterMySql(configuration);
-
+            configuration.SqlDialect = new MySqlDialect();
+            configuration.Schema = schema;
+            configuration.CommandInterpreter = new MySqlCommandInterpreter(configuration);
             configuration.ConnectionFactory = new DbConnectionFactory<MySqlConnection>(connectionString);
             configuration.IsolationLevel = isolationLevel;
 

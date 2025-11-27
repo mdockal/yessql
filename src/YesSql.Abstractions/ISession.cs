@@ -1,7 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Data;
-using System.Linq;
+using System.Data.Common;
+using System.Threading;
 using System.Threading.Tasks;
 using YesSql.Indexes;
 
@@ -10,18 +11,22 @@ namespace YesSql
     /// <summary>
     /// Represents a connection to the document store.
     /// </summary>
-    public interface ISession : IDisposable
+    public interface ISession : IDisposable, IAsyncDisposable
     {
         /// <summary>
         /// Saves a new or existing object to the store, and updates
         /// the corresponding indexes.
         /// </summary>
-        void Save(object obj);
+        /// <param name="obj">The entity to save.</param>
+        /// <param name="checkConcurrency">If true, a <see cref="ConcurrencyException"/> is thrown if the entity has been updated concurrently by another session.</param>
+        /// <param name="collection">The name of the collection to store the object in.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        Task SaveAsync(object obj, bool checkConcurrency = false, string collection = null, CancellationToken cancellationToken = default);
 
         /// <summary>
         /// Deletes an object and its indexes from the store.
         /// </summary>
-        void Delete(object item);
+        void Delete(object item, string collection = null);
 
         /// <summary>
         /// Imports an object in the local identity map.
@@ -35,78 +40,115 @@ namespace YesSql
         /// <returns>
         /// <c>true</c> if the object was imported, <c>false</c> otherwise.
         /// </returns>
-        bool Import(object item, int id);
+        bool Import(object item, long id, long version, string collection = null);
+
+        /// <summary>
+        /// Removes an item from the identity map.
+        /// </summary>
+        /// <remarks>
+        /// This method can be used to remove an item that should not be served again from the cache.
+        /// For instance when its state as changed and any subsequent query should not return the 
+        /// modified instance but a fresh one.
+        /// </remarks>
+        void Detach(object item, string collection = null);
+
+        /// <summary>
+        /// Removes multiple items from the identity map.
+        /// </summary>
+        /// <remarks>
+        /// This method can be used to remove multiple items that should not be served again from the cache.
+        /// For instance when its state as changed and any subsequent query should not return the 
+        /// modified instance but a fresh one.
+        /// </remarks>
+        void Detach(IEnumerable<object> entries, string collection = null);
+
+        /// <summary>
+        /// Removes all items from the identity map.
+        /// </summary>
+        void DetachAll(string collection = null);
 
         /// <summary>
         /// Loads objects by id.
         /// </summary>
         /// <returns>A collection of objects in the same order they were defined.</returns>
-        Task<IEnumerable<T>> GetAsync<T>(int[] ids) where T : class;
+        Task<IEnumerable<T>> GetAsync<T>(long[] ids, string collection = null, CancellationToken cancellationToken = default) where T : class;
 
         /// <summary>
         /// Creates a new <see cref="IQuery"/> object.
         /// </summary>
-        /// <returns></returns>
-        IQuery Query();
-
-        IQuery<T> ExecuteQuery<T>(ICompiledQuery<T> compiledQuery) where T : class;
-        
-        /// <summary>
-        /// Cancels any pending command.
-        /// </summary>
-        void Cancel();
+        IQuery Query(string collection = null);
 
         /// <summary>
-        /// Flushes the current commands asynchronously.
+        /// Executes a compiled query.
         /// </summary>
         /// <remarks>
-        /// Sessions are automatically flushed when disposed, however calling <see cref="CommitAsync"/>
-        /// is recommended before the session is disposed to prevent it from being called on a non-async
-        /// code path.
+        /// A compiled query is an instance of a class implementing <see cref="ICompiledQuery{T}" />.
+        /// Compiled queries allow YesSql to cache the SQL statement that would be otherwise generated
+        /// on each invocation of the LINQ query. 
         /// </remarks>
-        Task CommitAsync();
+        IQuery<T> ExecuteQuery<T>(ICompiledQuery<T> compiledQuery, string collection = null) where T : class;
 
         /// <summary>
-        /// Returns a <see cref="DbTransaction"/> that is used by this instance.
+        /// Marks the current session as "canceled" such that any following calls to <see cref="SaveChangesAsync(CancellationToken)"/> will be ignored.
+        /// This is useful when multiple components can add operations to the session and one of them fails, making the session invalid.
+        /// To instead rollback the transaction and revert any pending changes, use <see cref="ResetAsync"/>.
         /// </summary>
-        Task<IDbTransaction> DemandAsync();
+        Task CancelAsync();
+
+        /// <summary>
+        /// Resets the state of the current <see cref="ISession"/> by canceling any pending operations, closing the transaction, putting it back in a usable default state.
+        /// </summary>
+        Task ResetAsync();
+
+        /// <summary>
+        /// Flushes pending commands to the database.
+        /// </summary>
+        /// <remarks>
+        /// This doesn't commit or dispose of the transaction. A call to <see cref="SaveChangesAsync(CancellationToken)"/>
+        /// is still necessary for the changes to be visible from other transactions.
+        /// </remarks>
+        Task FlushAsync(CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// Flushes any changes, commits the transaction, and disposes the transaction.
+        /// </summary>
+        /// <remarks>
+        /// Sessions are not automatically committed when disposed, and <see cref="SaveChangesAsync(CancellationToken)"/>
+        /// must be called before disposing the <see cref="ISession"/>
+        /// </remarks>
+        Task SaveChangesAsync(CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// Creates or returns a <see cref="DbConnection"/>.
+        /// </summary>
+        Task<DbConnection> CreateConnectionAsync(CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// Creates or returns an existing <see cref="DbTransaction"/> with the default isolation level.
+        /// </summary>
+        Task<DbTransaction> BeginTransactionAsync(CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// Creates or returns an existing <see cref="DbTransaction"/> with the specified isolation level.
+        /// </summary>
+        Task<DbTransaction> BeginTransactionAsync(IsolationLevel isolationLevel, CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// Returns the current <see cref="DbTransaction"/> if it exists.
+        /// </summary>
+        DbTransaction CurrentTransaction { get; }
 
         /// <summary>
         /// Registers index providers that are used only during the lifetime of this session.
         /// </summary>
         /// <param name="indexProviders">The index providers to register.</param>
+        /// <param name="collection">The name of the collection to store the object in.</param>
         /// <returns>The <see cref="ISession"/> instance.</returns>
-        ISession RegisterIndexes(params IIndexProvider[] indexProviders);
+        ISession RegisterIndexes(IIndexProvider[] indexProviders, string collection = null);
 
+        /// <summary>
+        /// Gets the <see cref="Store" /> instance that created this session. 
+        /// </summary>
         IStore Store { get; }
-    }
-
-    public static class SessionExtensions
-    {
-        /// <summary>
-        /// Loads an object by its id.
-        /// </summary>
-        /// <returns>The object or <c>null</c>.</returns>
-        public async static Task<T> GetAsync<T>(this ISession session, int id) where T : class
-        {
-            return (await session.GetAsync<T>(new[] { id })).FirstOrDefault();
-        }
-
-        /// <summary>
-        /// Imports an object in the local identity map.
-        /// </summary>
-        /// <remarks>
-        /// This method can be used to re-attach an object that exists in the database
-        /// but was not loaded from this session, or has been duplicated. If not imported
-        /// in a session a duplicate record would tentatively be created in the database
-        /// and a duplicate primary key constraint would fail.
-        /// </remarks>
-        /// <returns>
-        /// <c>true</c> if the object was imported, <c>false</c> otherwise.
-        /// </returns>
-        public static bool Import(this ISession session, object item)
-        {
-            return session.Import(item, 0);
-        }
     }
 }

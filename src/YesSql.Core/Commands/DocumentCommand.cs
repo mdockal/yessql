@@ -1,12 +1,14 @@
-﻿using System.Data;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Data.Common;
 using System.Reflection;
+using System.Threading;
 using System.Threading.Tasks;
-using YesSql.Indexes;
-using YesSql.Sql;
 
 namespace YesSql.Commands
 {
-    public abstract class DocumentCommand : IIndexCommand
+    public abstract class DocumentCommand : IIndexCommand, ICollectionName
     {
         protected static readonly PropertyInfo[] AllProperties = new PropertyInfo[]
         {
@@ -20,13 +22,18 @@ namespace YesSql.Commands
 
         public abstract int ExecutionOrder { get; }
 
-        public DocumentCommand(Document document)
+        protected DocumentCommand(Document document, string collection)
         {
             Document = document;
+            Collection = collection;
         }
 
         public Document Document { get; }
 
-        public abstract Task ExecuteAsync(IDbConnection connection, IDbTransaction transaction, ISqlDialect dialect);
+        public string Collection { get; }
+
+        public abstract Task ExecuteAsync(DbConnection connection, DbTransaction transaction, ISqlDialect dialect, ILogger logger, CancellationToken cancellationToken = default);
+
+        public abstract bool AddToBatch(ISqlDialect dialect, List<string> queries, DbCommand parameters, List<Action<DbDataReader>> actions, int index);
     }
 }

@@ -1,5 +1,4 @@
 using System.Threading.Tasks;
-using Xunit;
 using YesSql;
 using YesSql.Indexes;
 using YesSql.Provider.SqlServer;
@@ -7,7 +6,7 @@ using YesSql.Sql;
 
 namespace Bench
 {
-    class Program
+    sealed class Program
     {
         static void Main(string[] args)
         {
@@ -16,31 +15,32 @@ namespace Bench
 
         static async Task MainAsync(string[] args)
         {
-            var store = new Store(
-                new Configuration()
+            var configuration = new Configuration()
                     .UseSqlServer(@"Data Source =.; Initial Catalog = yessql; Integrated Security = True")
-                    .SetTablePrefix("Bench")
-                );
+                    .SetTablePrefix("Bench");
 
-            await store.InitializeAsync();
-
-            using (var session = store.CreateSession())
+            await using (var connection = configuration.ConnectionFactory.CreateConnection())
             {
-                var builder = new SchemaBuilder(session);
+                await connection.OpenAsync();
 
-                builder.CreateMapIndexTable(nameof(UserByName), c => c
+                await using var transaction = await connection.BeginTransactionAsync(configuration.IsolationLevel);
+                var builder = new SchemaBuilder(configuration, transaction);
+
+                await builder.CreateMapIndexTableAsync<UserByName>(c => c
                     .Column<string>("Name")
                     .Column<bool>("Adult")
                     .Column<int>("Age")
                 );
+
+                await transaction.CommitAsync();
             }
 
+            var store = await StoreFactory.CreateAndInitializeAsync(configuration);
             store.RegisterIndexes<UserIndexProvider>();
 
-            using (var session = store.CreateSession())
+            await using (var session = store.CreateSession())
             {
                 var user = await session.Query<User>().FirstOrDefaultAsync();
-                Assert.Null(user);
 
                 var bill = new User
                 {
@@ -49,31 +49,26 @@ namespace Bench
                     Age = 1
                 };
 
-
-                session.Save(bill);
-
+                await session.SaveAsync(bill);
+                await session.SaveChangesAsync();
             }
 
-            using (var session = store.CreateSession())
+            await using (var session = store.CreateSession())
             {
                 var user = await session.Query<User, UserByName>().Where(x => x.Adult == true).FirstOrDefaultAsync();
-                Assert.NotNull(user);
 
                 user = await session.Query<User, UserByName>().Where(x => x.Age == 1).FirstOrDefaultAsync();
-                Assert.NotNull(user);
 
                 user = await session.Query<User, UserByName>().Where(x => x.Age == 1 && x.Adult).FirstOrDefaultAsync();
-                Assert.NotNull(user);
 
-                user = await session.Query<User, UserByName>().Where(x => x.Name.StartsWith("B")).FirstOrDefaultAsync();
-                Assert.NotNull(user);
+                user = await session.Query<User, UserByName>().Where(x => x.Name.StartsWith('B')).FirstOrDefaultAsync();
             }
         }
     }
 
     public class User
     {
-        public int Id { get; set; }
+        public long Id { get; set; }
         public string Name { get; set; }
         public bool Adult { get; set; }
         public int Age { get; set; }

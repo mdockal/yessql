@@ -7,7 +7,7 @@ using YesSql.Sql;
 
 namespace YesSql.Samples.Hi
 {
-    internal class Program
+    internal sealed class Program
     {
         static void Main(string[] args)
         {
@@ -16,24 +16,30 @@ namespace YesSql.Samples.Hi
 
         static async Task MainAsync(string[] args)
         {
-            var store = new Store(
+            var store = await StoreFactory.CreateAndInitializeAsync(
                 new Configuration()
                     .UseSqlServer(@"Data Source =.; Initial Catalog = yessql; Integrated Security = True")
                     .SetTablePrefix("Hi")
                 );
 
-            await store.InitializeAsync();
-
-            using (var session = store.CreateSession())
+            await using (var connection = store.Configuration.ConnectionFactory.CreateConnection())
             {
-                new SchemaBuilder(session).CreateMapIndexTable(nameof(BlogPostByAuthor), table => table
+                await connection.OpenAsync();
+
+                await using var transaction = await connection.BeginTransactionAsync(store.Configuration.IsolationLevel);
+                var builder = new SchemaBuilder(store.Configuration, transaction);
+
+                await builder.CreateMapIndexTableAsync<BlogPostByAuthor>(table => table
                         .Column<string>("Author")
-                    )
-                    .CreateReduceIndexTable(nameof(BlogPostByDay), table => table
+                    );
+
+                await builder.CreateReduceIndexTableAsync<BlogPostByDay>(table => table
                         .Column<int>("Count")
                         .Column<int>("Day")
-                    );
-            };
+                );
+
+                await transaction.CommitAsync();
+            }
 
             // register available indexes
             store.RegisterIndexes<BlogPostIndexProvider>();
@@ -49,22 +55,23 @@ namespace YesSql.Samples.Hi
             };
 
             // saving the post to the database
-            using (var session = store.CreateSession())
+            await using (var session = store.CreateSession())
             {
-                session.Save(post);
+                await session.SaveAsync(post);
+                await session.SaveChangesAsync();
             }
 
             // loading a single blog post
-            using (var session = store.CreateSession())
+            await using (var session = store.CreateSession())
             {
                 var p = await session.Query().For<BlogPost>().FirstOrDefaultAsync();
                 Console.WriteLine(p.Title); // > Hello YesSql
             }
 
             // loading blog posts by author
-            using (var session = store.CreateSession())
+            await using (var session = store.CreateSession())
             {
-                var ps = await session.Query<BlogPost, BlogPostByAuthor>().Where(x => x.Author.StartsWith("B")).ListAsync();
+                var ps = await session.Query<BlogPost, BlogPostByAuthor>().Where(x => x.Author.StartsWith('B')).ListAsync();
 
                 foreach (var p in ps)
                 {
@@ -73,7 +80,7 @@ namespace YesSql.Samples.Hi
             }
 
             // loading blog posts by day of publication
-            using (var session = store.CreateSession())
+            await using (var session = store.CreateSession())
             {
                 var ps = await session.Query<BlogPost, BlogPostByDay>(x => x.Day == DateTime.UtcNow.ToString("yyyyMMdd")).ListAsync();
 
@@ -84,7 +91,7 @@ namespace YesSql.Samples.Hi
             }
 
             // counting blog posts by day
-            using (var session = store.CreateSession())
+            await using (var session = store.CreateSession())
             {
                 var days = await session.QueryIndex<BlogPostByDay>().ListAsync();
 

@@ -2,62 +2,54 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
+using System;
 using System.Net;
 using System.Threading.Tasks;
 using Xunit;
-using YesSql.Provider.MySql;
-using YesSql.Provider.PostgreSql;
 using YesSql.Provider.Sqlite;
-using YesSql.Provider.SqlServer;
 
 namespace YesSql.Tests
 {
-    public class ProviderTests
+    public sealed class ProviderTests : IDisposable
     {
-        private const string ConnectionString = "Data Source=:memory:";
+        private readonly TemporaryFolder _tempFolder;
 
-        [Fact]
-        public async void AddedDbProviderStoreShouldPresentInDIContainer()
+        public ProviderTests()
         {
-            // Arrange
-            var builder = new WebHostBuilder()
-                .ConfigureServices(services =>
-                {
-                    // Act
-                    services.AddDbProvider(config => config.UseSqLite(ConnectionString));
-                })
-                .Configure(app =>
-                {
-                    app.Run(context =>
-                    {
-                        var store = context.RequestServices.GetService<IStore>();
+            _tempFolder = new TemporaryFolder();
+        }
 
-                        // Assert
-                        Assert.NotNull(store);
-                        return Task.FromResult(0);
-                    });
-                });
-
-            using (var server = new TestServer(builder))
-            {
-                var client = server.CreateClient();
-                var response = await client.GetAsync("/");
-
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            }
+        public void Dispose()
+        {
+            // _tempFolder.Dispose();
         }
 
         [Fact]
-        public void CanRegisterProviderSeveralTimes()
+        public async Task AddedDbProviderStoreShouldPresentInDIContainer()
         {
-            for (var i = 0; i < 2; i++)
+            var connectionString = @"Data Source=" + _tempFolder.Folder + "yessql.db;Cache=Shared";
+
+            // Arrange
+            var builder = WebApplication.CreateBuilder();
+            builder.WebHost.UseTestServer();
+            builder.Services.AddDbProvider(config => config.UseSqLite(connectionString).UseDefaultIdGenerator());
+        
+            using var app = builder.Build();
+
+            app.MapGet("/", context =>
             {
-                new Configuration()
-                    .RegisterMySql()
-                    .RegisterSqLite()
-                    .RegisterPostgreSql()
-                    .RegisterSqlServer();
-            }
+                var store = context.RequestServices.GetService<IStore>();
+
+                // Assert
+                Assert.NotNull(store);
+                return Task.CompletedTask;
+            });
+
+            await app.StartAsync();
+            var client = app.GetTestClient();
+            var response = await client.GetAsync("/");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         }
     }
 }

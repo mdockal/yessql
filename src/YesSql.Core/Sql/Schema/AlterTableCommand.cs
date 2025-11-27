@@ -1,5 +1,4 @@
 using System;
-using System.Data;
 
 namespace YesSql.Sql.Schema
 {
@@ -15,7 +14,7 @@ namespace YesSql.Sql.Schema
             _tablePrefix = tablePrefix;
         }
 
-        public void AddColumn(string columnName, DbType dbType, Action<IAddColumnCommand> column = null)
+        public void AddColumn(string columnName, Type dbType, Action<IAddColumnCommand> column = null)
         {
             var command = new AddColumnCommand(Name, columnName);
             command.WithType(dbType);
@@ -27,8 +26,7 @@ namespace YesSql.Sql.Schema
 
         public void AddColumn<T>(string columnName, Action<IAddColumnCommand> column = null)
         {
-            var dbType = SchemaUtils.ToDbType(typeof(T));
-            AddColumn(columnName, dbType, column);
+            AddColumn(columnName, typeof(T), column);
         }
 
         public void DropColumn(string columnName)
@@ -46,6 +44,14 @@ namespace YesSql.Sql.Schema
             TableCommands.Add(command);
         }
 
+        public void RenameColumn(string columnName, string newColumnName)
+        {
+            var command = new RenameColumnCommand(Name, columnName, newColumnName);
+
+            TableCommands.Add(command);
+        }
+
+
         public void CreateIndex(string indexName, params string[] columnNames)
         {
             if (_dialect.PrefixIndex)
@@ -53,7 +59,7 @@ namespace YesSql.Sql.Schema
                 indexName = _tablePrefix + indexName;
             }
 
-            var command = new AddIndexCommand(Name, indexName, columnNames);
+            var command = new AddIndexCommand(Name, _dialect.FormatIndexName(indexName), columnNames);
             TableCommands.Add(command);
         }
 
@@ -64,7 +70,7 @@ namespace YesSql.Sql.Schema
                 indexName = _tablePrefix + indexName;
             }
 
-            var command = new DropIndexCommand(Name, indexName);
+            var command = new DropIndexCommand(Name, _dialect.FormatIndexName(indexName));
             TableCommands.Add(command);
         }
     }

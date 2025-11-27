@@ -1,15 +1,16 @@
-﻿using System.Data;
+using System;
 
 namespace YesSql.Sql.Schema
 {
     public interface IColumnCommand : ITableCommand
     {
-        string ColumnName { get; set; }
-        byte Scale { get; }
+        string ColumnName { get; }
 
-        byte Precision { get; }
+        byte? Scale { get; }
 
-        DbType DbType { get; }
+        byte? Precision { get; }
+
+        Type DbType { get; }
 
         object Default { get; }
 
